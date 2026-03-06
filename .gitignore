@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and local caches
+.env
+.uv-cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.idea/
+
+# Generated outputs
+artifacts/
+data/question_pools/
+data/eval_pools/
+data/distill/
+
+# Large vendor checkouts
+vendor/
+
+# Local logs
+*.log
