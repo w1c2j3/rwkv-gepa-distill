@@ -13,6 +13,36 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT_DIR / ".venv" / "bin" / "python"
+KNOWN_COMMANDS = {
+    "prepare-pools",
+    "optimize-mmlu",
+    "generate-mmlu",
+    "filter-mmlu",
+    "export-sft",
+    "export-rwkv",
+    "sample-review",
+    "full-mmlu",
+}
+
+DEFAULT_DATASET_VERSION = "v1"
+DEFAULT_TRAIN_PATH = Path("data/question_pools/mmlu_dev.jsonl")
+DEFAULT_QUESTION_POOL_PATH = Path("data/question_pools/mmlu_auxiliary_train.jsonl")
+DEFAULT_GEPA_RUN_DIR = Path("artifacts/mmlu_gepa_run")
+DEFAULT_REPORT_PATH = Path("artifacts/mmlu_prompt_optimization_report.json")
+DEFAULT_RAW_OUTPUT_PATH = Path("data/distill/mmlu_batch_all.jsonl")
+DEFAULT_FAILED_OUTPUT_PATH = Path("artifacts/mmlu_batch_all_failed.jsonl")
+DEFAULT_FILTERED_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_strict.jsonl")
+DEFAULT_FILTER_STATS_PATH = Path("artifacts/mmlu_batch_all_filter_stats.json")
+DEFAULT_SFT_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_sft.jsonl")
+DEFAULT_RWKV_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_rwkv.jsonl")
+DEFAULT_REVIEW_OUTPUT_PATH = Path("artifacts/mmlu_batch_all_review_40.jsonl")
+DEFAULT_MAX_METRIC_CALLS = 40
+DEFAULT_LIMIT = 99842
+DEFAULT_MAX_CONCURRENCY = 6
+DEFAULT_GENERATE_PROGRESS = 100
+DEFAULT_STAGE_PROGRESS = 5000
+DEFAULT_SAMPLE_SIZE = 40
+DEFAULT_SAMPLE_SEED = 42
 
 
 @dataclass(frozen=True)
@@ -20,6 +50,21 @@ class TaskSpec:
     name: str
     description: str
     command: list[str]
+
+
+@dataclass(frozen=True)
+class DatasetPaths:
+    dataset_version: str
+    gepa_run_dir: Path
+    prompt_bundle_path: Path
+    report_path: Path
+    raw_output_path: Path
+    failed_output_path: Path
+    filtered_output_path: Path
+    filter_stats_path: Path
+    sft_output_path: Path
+    rwkv_output_path: Path
+    review_output_path: Path
 
 
 def default_python() -> str:
@@ -43,150 +88,138 @@ def format_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
-def run_tasks(tasks: list[TaskSpec]) -> None:
-    if not tasks:
-        raise ValueError("No tasks to run.")
+def normalize_dataset_version(dataset_version: str) -> str:
+    normalized = dataset_version.strip()
+    if not normalized:
+        raise ValueError("--dataset-version must be non-empty")
+    return normalized
 
+
+def dataset_paths(dataset_version: str) -> DatasetPaths:
+    normalized = normalize_dataset_version(dataset_version)
+    artifact_dir = Path("artifacts") / normalized
+    distill_dir = Path("data/distill") / normalized
+    return DatasetPaths(
+        dataset_version=normalized,
+        gepa_run_dir=artifact_dir / "mmlu_gepa_run",
+        prompt_bundle_path=artifact_dir / "mmlu_prompt_bundle.jsonl",
+        report_path=artifact_dir / "mmlu_prompt_optimization_report.json",
+        raw_output_path=distill_dir / "mmlu_batch_all.jsonl",
+        failed_output_path=artifact_dir / "mmlu_batch_all_failed.jsonl",
+        filtered_output_path=distill_dir / "mmlu_batch_all_strict.jsonl",
+        filter_stats_path=artifact_dir / "mmlu_batch_all_filter_stats.json",
+        sft_output_path=distill_dir / "mmlu_batch_all_sft.jsonl",
+        rwkv_output_path=distill_dir / "mmlu_batch_all_rwkv.jsonl",
+        review_output_path=artifact_dir / "mmlu_batch_all_review_40.jsonl",
+    )
+
+
+def run_tasks(tasks: list[TaskSpec]) -> None:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    total = len(tasks)
     started = time.monotonic()
+    total = len(tasks)
     for index, task in enumerate(tasks, start=1):
         print(f"[{index}/{total}] {task.name}", flush=True)
         print(f"desc={task.description}", flush=True)
         print(f"cmd={command_display(task.command)}", flush=True)
         task_started = time.monotonic()
         subprocess.run(task.command, cwd=ROOT_DIR, env=env, check=True)
-        elapsed = time.monotonic() - task_started
-        print(f"status=completed task={task.name} elapsed={format_duration(elapsed)}", flush=True)
+        print(
+            f"status=completed task={task.name} elapsed={format_duration(time.monotonic() - task_started)}",
+            flush=True,
+        )
 
-    total_elapsed = time.monotonic() - started
-    print(f"pipeline_status=completed elapsed={format_duration(total_elapsed)}", flush=True)
+    print(f"pipeline_status=completed elapsed={format_duration(time.monotonic() - started)}", flush=True)
 
 
 def add_prepare_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--force", action="store_true", help="Rebuild pools even if cached JSONL exists.")
-    parser.add_argument(
-        "--include-community",
-        action="store_true",
-        help="Also prepare community training pools.",
-    )
-    parser.add_argument(
-        "--only",
-        choices=("primary", "eval", "all"),
-        default="all",
-        help="Pool category selection for prepare_mmlu_pools.py.",
-    )
-    parser.add_argument("--limit", type=int, default=None, help="Optional row cap passed to the prepare step.")
+    parser.add_argument("--force", action="store_true", help="Rebuild primary pools even if cached JSONL exists.")
+    parser.add_argument("--include-community", action="store_true", help="Also build optional community pools.")
+    parser.add_argument("--only", choices=("primary", "eval", "all"), default="primary")
+    parser.add_argument("--limit", type=int, default=None)
+
+
+def add_dataset_version_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--dataset-version", default=DEFAULT_DATASET_VERSION)
 
 
 def add_optimize_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--train-path",
-        type=Path,
-        default=Path("data/question_pools/mmlu_dev.jsonl"),
-    )
-    parser.add_argument(
-        "--val-path",
-        type=Path,
-        default=Path("data/question_pools/mmlu_validation.jsonl"),
-    )
+    add_dataset_version_arg(parser)
+    parser.add_argument("--train-path", type=Path, default=DEFAULT_TRAIN_PATH)
+    parser.add_argument("--question-pool-path", type=Path, default=DEFAULT_QUESTION_POOL_PATH)
     parser.add_argument("--train-limit", type=int, default=10)
-    parser.add_argument("--val-limit", type=int, default=10)
-    parser.add_argument("--max-metric-calls", type=int, default=40)
-    parser.add_argument(
-        "--best-prompt-path",
-        type=Path,
-        default=Path("artifacts/mmlu_best_prompt.txt"),
-    )
-    parser.add_argument(
-        "--report-path",
-        type=Path,
-        default=Path("artifacts/mmlu_prompt_optimization_report.json"),
-    )
-    parser.add_argument(
-        "--fresh-run-dir",
-        action="store_true",
-        default=True,
-        help="Reset the GEPA run directory before optimization.",
-    )
-    parser.add_argument(
-        "--no-fresh-run-dir",
-        dest="fresh_run_dir",
-        action="store_false",
-        help="Reuse the existing GEPA run directory if present.",
-    )
+    parser.add_argument("--target-limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--max-metric-calls", type=int, default=DEFAULT_MAX_METRIC_CALLS)
+    parser.add_argument("--gepa-run-dir", type=Path, default=None)
+    parser.add_argument("--prompt-bundle-path", type=Path, default=None)
+    parser.add_argument("--report-path", type=Path, default=None)
+    parser.add_argument("--fresh-run-dir", action="store_true", default=True)
+    parser.add_argument("--no-fresh-run-dir", dest="fresh_run_dir", action="store_false")
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
 
 
 def add_generate_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--question-pool-path",
-        type=Path,
-        default=Path("data/question_pools/mmlu_auxiliary_train.jsonl"),
-    )
-    parser.add_argument(
-        "--best-prompt-path",
-        type=Path,
-        default=Path("artifacts/mmlu_best_prompt.txt"),
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all.jsonl"),
-    )
-    parser.add_argument("--limit", type=int, default=99842)
-    parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=6,
-        help="Teacher API concurrency. Keep <= 6 for unstable proxy endpoints.",
-    )
-    parser.add_argument("--progress-interval", type=int, default=100)
+    add_dataset_version_arg(parser)
+    parser.add_argument("--question-pool-path", type=Path, default=DEFAULT_QUESTION_POOL_PATH)
+    parser.add_argument("--prompt-bundle-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--failed-output-path", type=Path, default=None)
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
+    parser.add_argument("--retry-rounds", type=int, default=3)
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
 
 
 def add_filter_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--input-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all.jsonl"),
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all_correct.jsonl"),
-    )
-    parser.add_argument("--progress-interval", type=int, default=5000)
-
-
-def add_sample_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--input-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all_correct.jsonl"),
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        default=Path("artifacts/mmlu_batch_all_review_40.jsonl"),
-    )
-    parser.add_argument("--sample-size", type=int, default=40)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--progress-interval", type=int, default=5000)
+    add_dataset_version_arg(parser)
+    parser.add_argument("--input-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--stats-path", type=Path, default=None)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
 
 
 def add_export_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--input-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all_correct.jsonl"),
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        default=Path("data/distill/mmlu_batch_all_sft.jsonl"),
-    )
-    parser.add_argument("--progress-interval", type=int, default=5000)
+    add_dataset_version_arg(parser)
+    parser.add_argument("--input-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+
+
+def add_export_rwkv_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
+    parser.add_argument("--input-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+
+
+def add_sample_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
+    parser.add_argument("--input-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SAMPLE_SEED)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+
+
+def add_full_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
+    parser.add_argument("--force-pools", action="store_true")
+    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
+    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
+    parser.add_argument("--filter-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    parser.add_argument("--export-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    parser.add_argument("--rwkv-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    parser.add_argument("--sample-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    parser.add_argument("--retry-rounds", type=int, default=3)
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
 
 
 def prepare_command(args: argparse.Namespace, python_bin: str) -> list[str]:
@@ -201,6 +234,7 @@ def prepare_command(args: argparse.Namespace, python_bin: str) -> list[str]:
 
 
 def optimize_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
     command = [
         python_bin,
         "-u",
@@ -208,25 +242,32 @@ def optimize_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "distill_gepa.optimize_mmlu_prompt",
         "--train-path",
         str(args.train_path),
-        "--val-path",
-        str(args.val_path),
+        "--question-pool-path",
+        str(args.question_pool_path),
         "--train-limit",
         str(args.train_limit),
-        "--val-limit",
-        str(args.val_limit),
+        "--target-limit",
+        str(args.target_limit),
         "--max-metric-calls",
         str(args.max_metric_calls),
-        "--best-prompt-path",
-        str(args.best_prompt_path),
+        "--gepa-run-dir",
+        str(args.gepa_run_dir or paths.gepa_run_dir),
+        "--prompt-bundle-path",
+        str(args.prompt_bundle_path or paths.prompt_bundle_path),
         "--report-path",
-        str(args.report_path),
+        str(args.report_path or paths.report_path),
+        "--progress-interval",
+        str(args.progress_interval),
     ]
     if args.fresh_run_dir:
         command.append("--fresh-run-dir")
+    if args.resume:
+        command.append("--resume")
     return command
 
 
 def generate_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
     command = [
         python_bin,
         "-u",
@@ -234,47 +275,87 @@ def generate_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "distill_gepa.generate_mmlu_batch",
         "--question-pool-path",
         str(args.question_pool_path),
-        "--best-prompt-path",
-        str(args.best_prompt_path),
+        "--prompt-bundle-path",
+        str(args.prompt_bundle_path or paths.prompt_bundle_path),
         "--output-path",
-        str(args.output_path),
+        str(args.output_path or paths.raw_output_path),
+        "--failed-output-path",
+        str(args.failed_output_path or paths.failed_output_path),
         "--limit",
         str(args.limit),
         "--max-concurrency",
         str(args.max_concurrency),
         "--progress-interval",
         str(args.progress_interval),
+        "--retry-rounds",
+        str(args.retry_rounds),
     ]
-    if getattr(args, "resume", False):
+    if args.resume:
         command.append("--resume")
     return command
 
 
 def filter_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
     return [
         python_bin,
         "-u",
         "-m",
         "distill_gepa.filter_mmlu_batch",
         "--input-path",
-        str(args.input_path),
+        str(args.input_path or paths.raw_output_path),
         "--output-path",
-        str(args.output_path),
+        str(args.output_path or paths.filtered_output_path),
+        "--stats-path",
+        str(args.stats_path or paths.filter_stats_path),
+        "--progress-interval",
+        str(args.progress_interval),
+    ]
+
+
+def export_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    return [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.export_sft_dataset",
+        "--input-path",
+        str(args.input_path or paths.filtered_output_path),
+        "--output-path",
+        str(args.output_path or paths.sft_output_path),
+        "--progress-interval",
+        str(args.progress_interval),
+    ]
+
+
+def export_rwkv_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    return [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.export_rwkv_dataset",
+        "--input-path",
+        str(args.input_path or paths.sft_output_path),
+        "--output-path",
+        str(args.output_path or paths.rwkv_output_path),
         "--progress-interval",
         str(args.progress_interval),
     ]
 
 
 def sample_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
     return [
         python_bin,
         "-u",
         "-m",
         "distill_gepa.sample_review_set",
         "--input-path",
-        str(args.input_path),
+        str(args.input_path or paths.filtered_output_path),
         "--output-path",
-        str(args.output_path),
+        str(args.output_path or paths.review_output_path),
         "--sample-size",
         str(args.sample_size),
         "--seed",
@@ -284,268 +365,138 @@ def sample_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     ]
 
 
-def export_command(args: argparse.Namespace, python_bin: str) -> list[str]:
-    return [
-        python_bin,
-        "-u",
-        "-m",
-        "distill_gepa.export_sft_dataset",
-        "--input-path",
-        str(args.input_path),
-        "--output-path",
-        str(args.output_path),
-        "--progress-interval",
-        str(args.progress_interval),
-    ]
-
-
-def batch_100_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
-    prepare_args = argparse.Namespace(
-        force=args.force_pools,
-        include_community=False,
-        only="primary",
-        limit=None,
-    )
+def build_full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
+    paths = dataset_paths(args.dataset_version)
+    prepare_args = argparse.Namespace(force=args.force_pools, include_community=False, only="primary", limit=None)
     optimize_args = argparse.Namespace(
-        train_path=Path("data/question_pools/mmlu_dev.jsonl"),
-        val_path=Path("data/question_pools/mmlu_validation.jsonl"),
+        dataset_version=args.dataset_version,
+        train_path=DEFAULT_TRAIN_PATH,
+        question_pool_path=DEFAULT_QUESTION_POOL_PATH,
         train_limit=10,
-        val_limit=10,
-        max_metric_calls=40,
-        best_prompt_path=Path("artifacts/mmlu_best_prompt.txt"),
-        report_path=Path("artifacts/mmlu_prompt_optimization_report.json"),
+        target_limit=args.limit,
+        max_metric_calls=DEFAULT_MAX_METRIC_CALLS,
+        gepa_run_dir=paths.gepa_run_dir,
+        prompt_bundle_path=paths.prompt_bundle_path,
+        report_path=paths.report_path,
         fresh_run_dir=True,
+        resume=args.resume,
+        progress_interval=args.progress_interval,
     )
     generate_args = argparse.Namespace(
-        question_pool_path=Path("data/question_pools/mmlu_auxiliary_train.jsonl"),
-        best_prompt_path=Path("artifacts/mmlu_best_prompt.txt"),
-        output_path=Path("data/distill/mmlu_batch_100.jsonl"),
-        limit=100,
-        max_concurrency=args.max_concurrency,
-        progress_interval=10,
-        resume=False,
-    )
-    sample_args = argparse.Namespace(
-        input_path=Path("data/distill/mmlu_batch_100.jsonl"),
-        output_path=Path("artifacts/mmlu_batch_review_40.jsonl"),
-        sample_size=40,
-        seed=42,
-        progress_interval=100,
-    )
-    return [
-        TaskSpec(
-            name="prepare-pools",
-            description="Check or build the primary MMLU question pools.",
-            command=prepare_command(prepare_args, python_bin),
-        ),
-        TaskSpec(
-            name="optimize-mmlu-prompt",
-            description="Use GEPA to optimize the teacher system prompt on dev/validation slices.",
-            command=optimize_command(optimize_args, python_bin),
-        ),
-        TaskSpec(
-            name="generate-100",
-            description="Generate the first 100 auxiliary_train teacher responses.",
-            command=generate_command(generate_args, python_bin),
-        ),
-        TaskSpec(
-            name="sample-review-40",
-            description="Draw a random 40-row review sample from the 100-row batch.",
-            command=sample_command(sample_args, python_bin),
-        ),
-    ]
-
-
-def full_mmlu_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
-    prepare_args = argparse.Namespace(
-        force=args.force_pools,
-        include_community=False,
-        only="primary",
-        limit=None,
-    )
-    optimize_args = argparse.Namespace(
-        train_path=Path("data/question_pools/mmlu_dev.jsonl"),
-        val_path=Path("data/question_pools/mmlu_validation.jsonl"),
-        train_limit=10,
-        val_limit=10,
-        max_metric_calls=40,
-        best_prompt_path=Path("artifacts/mmlu_best_prompt.txt"),
-        report_path=Path("artifacts/mmlu_prompt_optimization_report.json"),
-        fresh_run_dir=True,
-    )
-    generate_args = argparse.Namespace(
-        question_pool_path=Path("data/question_pools/mmlu_auxiliary_train.jsonl"),
-        best_prompt_path=Path("artifacts/mmlu_best_prompt.txt"),
-        output_path=Path("data/distill/mmlu_batch_all.jsonl"),
+        dataset_version=args.dataset_version,
+        question_pool_path=DEFAULT_QUESTION_POOL_PATH,
+        prompt_bundle_path=paths.prompt_bundle_path,
+        output_path=paths.raw_output_path,
+        failed_output_path=paths.failed_output_path,
         limit=args.limit,
         max_concurrency=args.max_concurrency,
         progress_interval=args.progress_interval,
-        resume=True,
+        retry_rounds=args.retry_rounds,
+        resume=args.resume,
     )
     filter_args = argparse.Namespace(
-        input_path=Path("data/distill/mmlu_batch_all.jsonl"),
-        output_path=Path("data/distill/mmlu_batch_all_correct.jsonl"),
+        dataset_version=args.dataset_version,
+        input_path=paths.raw_output_path,
+        output_path=paths.filtered_output_path,
+        stats_path=paths.filter_stats_path,
         progress_interval=args.filter_progress_interval,
     )
     export_args = argparse.Namespace(
-        input_path=Path("data/distill/mmlu_batch_all_correct.jsonl"),
-        output_path=Path("data/distill/mmlu_batch_all_sft.jsonl"),
+        dataset_version=args.dataset_version,
+        input_path=paths.filtered_output_path,
+        output_path=paths.sft_output_path,
         progress_interval=args.export_progress_interval,
     )
+    export_rwkv_args = argparse.Namespace(
+        dataset_version=args.dataset_version,
+        input_path=paths.sft_output_path,
+        output_path=paths.rwkv_output_path,
+        progress_interval=args.rwkv_progress_interval,
+    )
     sample_args = argparse.Namespace(
-        input_path=Path("data/distill/mmlu_batch_all_correct.jsonl"),
-        output_path=Path("artifacts/mmlu_batch_all_review_40.jsonl"),
-        sample_size=40,
-        seed=42,
+        dataset_version=args.dataset_version,
+        input_path=paths.filtered_output_path,
+        output_path=paths.review_output_path,
+        sample_size=DEFAULT_SAMPLE_SIZE,
+        seed=DEFAULT_SAMPLE_SEED,
         progress_interval=args.sample_progress_interval,
     )
     return [
-        TaskSpec(
-            name="prepare-pools",
-            description="Check or build the primary MMLU question pools.",
-            command=prepare_command(prepare_args, python_bin),
-        ),
-        TaskSpec(
-            name="optimize-mmlu-prompt",
-            description="Use GEPA to optimize the teacher system prompt on dev/validation slices.",
-            command=optimize_command(optimize_args, python_bin),
-        ),
-        TaskSpec(
-            name="generate-full",
-            description="Generate teacher responses for the full auxiliary_train pool.",
-            command=generate_command(generate_args, python_bin),
-        ),
-        TaskSpec(
-            name="filter-correct",
-            description="Keep only rows whose parsed answer matches the gold label.",
-            command=filter_command(filter_args, python_bin),
-        ),
-        TaskSpec(
-            name="export-sft",
-            description="Export the filtered correct rows into an SFT-ready JSONL dataset.",
-            command=export_command(export_args, python_bin),
-        ),
-        TaskSpec(
-            name="sample-review-40",
-            description="Draw a random 40-row review sample from the filtered full batch.",
-            command=sample_command(sample_args, python_bin),
-        ),
+        TaskSpec("prepare-pools", "Check or build the primary MMLU question pools.", prepare_command(prepare_args, python_bin)),
+        TaskSpec("optimize-mmlu-prompt", "Use GEPA to optimize a per-row teacher prompt bundle.", optimize_command(optimize_args, python_bin)),
+        TaskSpec("generate-mmlu", "Generate teacher responses for the full auxiliary_train pool with the prompt bundle.", generate_command(generate_args, python_bin)),
+        TaskSpec("filter-mmlu", "Keep only strict JSON rows that are usable for SFT.", filter_command(filter_args, python_bin)),
+        TaskSpec("export-sft", "Export the filtered rows into the strict SFT JSONL dataset.", export_command(export_args, python_bin)),
+        TaskSpec("export-rwkv", "Export the strict SFT rows into the final RWKV training JSONL dataset.", export_rwkv_command(export_rwkv_args, python_bin)),
+        TaskSpec("sample-review", "Draw a random review sample from the filtered dataset.", sample_command(sample_args, python_bin)),
     ]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Scheduler for rwkv-gepa-distill task pipelines.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(description="Unified scheduler for the rwkv-gepa-distill MMLU pipeline.")
+    subparsers = parser.add_subparsers(dest="command")
 
-    prepare_parser = subparsers.add_parser("prepare-pools", help="Prepare Hugging Face question/eval pools.")
+    prepare_parser = subparsers.add_parser("prepare-pools", help="Prepare question pools.")
     add_prepare_args(prepare_parser)
 
-    optimize_parser = subparsers.add_parser("optimize-mmlu", help="Run GEPA prompt optimization for MMLU.")
+    optimize_parser = subparsers.add_parser("optimize-mmlu", help="Optimize a per-row teacher prompt bundle with GEPA.")
     add_optimize_args(optimize_parser)
 
-    generate_parser = subparsers.add_parser("generate-mmlu", help="Generate teacher answers for a question pool.")
+    generate_parser = subparsers.add_parser("generate-mmlu", help="Generate teacher answers from the prompt bundle.")
     add_generate_args(generate_parser)
-    generate_parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from an existing partial output file.",
-    )
 
-    filter_parser = subparsers.add_parser("filter-mmlu", help="Keep only correct generated teacher rows.")
+    filter_parser = subparsers.add_parser("filter-mmlu", help="Filter to strict JSON rows usable for SFT.")
     add_filter_args(filter_parser)
 
-    sample_parser = subparsers.add_parser("sample-review", help="Sample a random review subset from JSONL.")
-    add_sample_args(sample_parser)
-
-    export_parser = subparsers.add_parser("export-sft", help="Export filtered rows into SFT-ready JSONL.")
+    export_parser = subparsers.add_parser("export-sft", help="Export filtered rows to SFT JSONL.")
     add_export_args(export_parser)
 
-    batch_parser = subparsers.add_parser("batch-100", help="One-command 100-row MMLU pipeline.")
-    batch_parser.add_argument(
-        "--force-pools",
-        action="store_true",
-        help="Rebuild primary pools even if the cached JSONL files already exist.",
-    )
-    batch_parser.add_argument(
-        "--max-concurrency",
-        type=int,
-        default=6,
-        help="Teacher API concurrency for the 100-row batch.",
-    )
+    export_rwkv_parser = subparsers.add_parser("export-rwkv", help="Export SFT rows to RWKV JSONL.")
+    add_export_rwkv_args(export_rwkv_parser)
 
-    full_parser = subparsers.add_parser("full-mmlu", help="One-command full auxiliary_train pipeline.")
-    full_parser.add_argument(
-        "--force-pools",
-        action="store_true",
-        help="Rebuild primary pools even if the cached JSONL files already exist.",
-    )
-    full_parser.add_argument("--limit", type=int, default=99842)
-    full_parser.add_argument("--max-concurrency", type=int, default=6)
-    full_parser.add_argument("--progress-interval", type=int, default=100)
-    full_parser.add_argument("--filter-progress-interval", type=int, default=5000)
-    full_parser.add_argument("--export-progress-interval", type=int, default=5000)
-    full_parser.add_argument("--sample-progress-interval", type=int, default=5000)
+    sample_parser = subparsers.add_parser("sample-review", help="Sample a review subset.")
+    add_sample_args(sample_parser)
+
+    full_parser = subparsers.add_parser("full-mmlu", help="Run the complete default MMLU pipeline.")
+    add_full_args(full_parser)
 
     return parser
 
 
+def parse_scheduler_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    argv = sys.argv[1:]
+    if not argv:
+        return parser.parse_args(["full-mmlu"])
+    if argv[0] in {"-h", "--help"}:
+        return parser.parse_args(argv)
+    if argv[0] in KNOWN_COMMANDS:
+        return parser.parse_args(argv)
+    if argv[0].startswith("-"):
+        return parser.parse_args(["full-mmlu", *argv])
+    return parser.parse_args(argv)
+
+
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parse_scheduler_args(parser)
     python_bin = default_python()
 
     if args.command == "prepare-pools":
-        tasks = [
-            TaskSpec(
-                name="prepare-pools",
-                description="Prepare normalized MMLU question and evaluation pools.",
-                command=prepare_command(args, python_bin),
-            )
-        ]
+        tasks = [TaskSpec("prepare-pools", "Prepare normalized MMLU pools.", prepare_command(args, python_bin))]
     elif args.command == "optimize-mmlu":
-        tasks = [
-            TaskSpec(
-                name="optimize-mmlu-prompt",
-                description="Use GEPA to optimize the teacher system prompt.",
-                command=optimize_command(args, python_bin),
-            )
-        ]
+        tasks = [TaskSpec("optimize-mmlu-prompt", "Use GEPA to optimize a per-row teacher prompt bundle.", optimize_command(args, python_bin))]
     elif args.command == "generate-mmlu":
-        tasks = [
-            TaskSpec(
-                name="generate-mmlu",
-                description="Generate teacher responses for the configured question pool.",
-                command=generate_command(args, python_bin),
-            )
-        ]
-    elif args.command == "export-sft":
-        tasks = [
-            TaskSpec(
-                name="export-sft",
-                description="Export filtered rows into an SFT-ready JSONL dataset.",
-                command=export_command(args, python_bin),
-            )
-        ]
+        tasks = [TaskSpec("generate-mmlu", "Generate teacher responses with the prompt bundle.", generate_command(args, python_bin))]
     elif args.command == "filter-mmlu":
-        tasks = [
-            TaskSpec(
-                name="filter-correct",
-                description="Filter the generated JSONL down to correct teacher answers.",
-                command=filter_command(args, python_bin),
-            )
-        ]
+        tasks = [TaskSpec("filter-mmlu", "Filter to strict JSON rows usable for SFT.", filter_command(args, python_bin))]
+    elif args.command == "export-sft":
+        tasks = [TaskSpec("export-sft", "Export filtered rows into the strict SFT dataset.", export_command(args, python_bin))]
+    elif args.command == "export-rwkv":
+        tasks = [TaskSpec("export-rwkv", "Export strict SFT rows into the final RWKV dataset.", export_rwkv_command(args, python_bin))]
     elif args.command == "sample-review":
-        tasks = [
-            TaskSpec(
-                name="sample-review",
-                description="Sample review rows from an input JSONL.",
-                command=sample_command(args, python_bin),
-            )
-        ]
-    elif args.command == "batch-100":
-        tasks = batch_100_tasks(args, python_bin)
+        tasks = [TaskSpec("sample-review", "Sample review rows from the filtered dataset.", sample_command(args, python_bin))]
     elif args.command == "full-mmlu":
-        tasks = full_mmlu_tasks(args, python_bin)
+        tasks = build_full_tasks(args, python_bin)
     else:
         raise ValueError(f"Unsupported scheduler command: {args.command}")
 

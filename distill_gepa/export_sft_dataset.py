@@ -6,6 +6,8 @@ from typing import Any
 
 import orjson
 
+from .mmlu_score import score_mcq_response
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -14,7 +16,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=Path("data/distill/mmlu_batch_all_correct.jsonl"),
+        default=Path("data/distill/mmlu_batch_all_strict.jsonl"),
     )
     parser.add_argument(
         "--output-path",
@@ -29,6 +31,7 @@ def build_sft_row(payload: dict[str, Any]) -> dict[str, Any]:
     system_prompt = payload.get("system_prompt")
     instruction = payload.get("instruction")
     teacher_response = payload.get("teacher_response")
+    teacher_parsed = payload.get("teacher_parsed")
     meta = payload.get("meta")
     source_question = payload.get("source_question")
 
@@ -38,10 +41,31 @@ def build_sft_row(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Missing non-empty 'instruction'")
     if not isinstance(teacher_response, str) or not teacher_response.strip():
         raise ValueError("Missing non-empty 'teacher_response'")
+    if not isinstance(teacher_parsed, dict):
+        raise ValueError("Missing object 'teacher_parsed'")
     if not isinstance(meta, dict):
         raise ValueError("Missing object 'meta'")
     if not isinstance(source_question, dict):
         raise ValueError("Missing object 'source_question'")
+
+    choices = source_question.get("choices")
+    gold_answer_index = source_question.get("answer_index")
+    pool_subject = source_question.get("subject", "")
+    if not isinstance(choices, list) or not all(isinstance(item, str) for item in choices):
+        raise ValueError("Missing string list 'source_question.choices'")
+    if gold_answer_index is not None and not isinstance(gold_answer_index, int):
+        raise ValueError("Missing integer 'source_question.answer_index'")
+    if not isinstance(pool_subject, str):
+        pool_subject = ""
+
+    recomputed = score_mcq_response(
+        teacher_response,
+        choices,
+        gold_answer_index,
+        pool_subject=pool_subject,
+    )
+    if not recomputed.usable_for_sft:
+        raise ValueError("Input row is not usable_for_sft under the current strict JSON contract")
 
     source_meta = source_question.get("meta")
     if not isinstance(source_meta, dict):
@@ -56,10 +80,13 @@ def build_sft_row(payload: dict[str, Any]) -> dict[str, Any]:
             "teacher_model": meta.get("teacher_model"),
             "source_dataset": source_question.get("source_dataset"),
             "source_split": source_question.get("source_split"),
-            "subject": source_question.get("subject"),
+            "pool_subject": meta.get("pool_subject", source_question.get("subject")),
+            "teacher_subject": recomputed.parsed.subject,
+            "subject_match_pool": meta.get("subject_match_pool"),
             "answer_label": source_question.get("answer_label"),
             "answer_index": source_question.get("answer_index"),
             "source_subject_config": source_meta.get("source_subject_config"),
+            "output_contract": "strict_json_mcq_v1",
         },
     }
 

@@ -1,9 +1,15 @@
-"""Minimal scaffold for teacher prompt optimization and distillation."""
+"""Core modules for the MMLU teacher-distillation pipeline."""
 
 __all__ = [
     "common",
-    "generate_small_dataset",
-    "optimize_prompt",
-    "score",
+    "export_rwkv_dataset",
+    "export_sft_dataset",
+    "filter_mmlu_batch",
+    "generate_mmlu_batch",
+    "mmlu_score",
+    "optimize_mmlu_prompt",
+    "question_pools",
+    "reflection_lm",
+    "sample_review_set",
     "teacher_client",
 ]

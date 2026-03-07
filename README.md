@@ -1,134 +1,221 @@
-# RWKV GEPA Distill Smoke Scaffold
+# RWKV GEPA Distill
 
-Minimal runnable scaffold for:
+Minimal MMLU-focused data pipeline for:
 
-- API teacher model
-- GEPA prompt optimization
-- RWKV student distillation handoff
+- preparing MMLU question pools from Hugging Face `datasets`
+- optimizing a teacher system prompt with GEPA for each target row
+- generating teacher answers through an OpenAI-compatible API
+- filtering to strict JSON-only SFT rows
+- exporting a final RWKV training `jsonl`
 
-The first milestone is a smoke test that:
+This repository is intentionally scoped to data generation and export.
+Training and evaluation are expected to happen in separate projects.
 
-1. selects an optimized teacher system prompt on a tiny validation seed set,
-2. saves the prompt to `artifacts/best_prompt.txt`,
-3. generates `data/distill/distill_small.jsonl`.
+The official prompt-optimization artifact is only `artifacts/<version>/mmlu_prompt_bundle.jsonl`.
+The old standalone `mmlu_best_prompt.txt` output is no longer part of the pipeline.
 
-## Commands
+## Output Contract
+
+The teacher is optimized to return exactly one valid JSON object with these keys:
+
+```json
+{
+  "answer_letter": "A",
+  "answer_index": 0,
+  "answer_text": "exact option text",
+  "reasoning": "brief explanation"
+}
+```
+
+Rules enforced by the pipeline:
+
+- only raw teacher responses that are already valid JSON can enter SFT
+- parser recovery is allowed for diagnostics only
+- non-JSON rows are kept in raw outputs, but never enter strict SFT or RWKV exports
+- the final RWKV dataset keeps the original teacher JSON string as the assistant target
+
+## Prompt Bundle Contract
+
+Each line of `artifacts/v1/mmlu_prompt_bundle.jsonl` records one full prompt-optimization trace for one question:
+
+```json
+{
+  "bundle_contract": "mmlu_prompt_trace_v1",
+  "source_row_index": 17,
+  "question": {
+    "source_dataset": "cais/mmlu",
+    "source_split": "auxiliary_train",
+    "subject": "high_school_biology",
+    "question": "Which organelle is primarily responsible for ATP production?",
+    "choices": [
+      "Ribosome",
+      "Mitochondrion",
+      "Golgi apparatus",
+      "Lysosome"
+    ],
+    "answer": "B",
+    "answer_index": 1,
+    "answer_label": "B",
+    "prompt_text": "Subject: high_school_biology\nQuestion: Which organelle is primarily responsible for ATP production?\nOptions:\nA. Ribosome\nB. Mitochondrion\nC. Golgi apparatus\nD. Lysosome",
+    "meta": {}
+  },
+  "prompt": "original system prompt text",
+  "prompt_version": "sha256:...",
+  "prompt_teacher_response": "{\"answer_letter\":\"B\",\"answer_index\":1,\"answer_text\":\"Mitochondrion\",\"reasoning\":\"Mitochondria are the primary site of aerobic ATP production in eukaryotic cells.\"}",
+  "prompt_score": {
+    "total": 1.0,
+    "valid_json": true,
+    "correct": true,
+    "usable_for_sft": true
+  },
+  "best_prompt": "optimized system prompt text",
+  "best_prompt_version": "sha256:...",
+  "best_prompt_teacher_response": "{\"answer_letter\":\"B\",\"answer_index\":1,\"answer_text\":\"Mitochondrion\",\"reasoning\":\"The mitochondrion generates most ATP through oxidative phosphorylation.\"}",
+  "best_prompt_score": {
+    "total": 1.0,
+    "valid_json": true,
+    "correct": true,
+    "usable_for_sft": true
+  },
+  "optimizer": {
+    "mode": "gepa",
+    "best_score": 1.0,
+    "generated_at_utc": "2026-03-07T12:34:56+00:00"
+  },
+  "comparison": {
+    "prompt_changed": true,
+    "prompt_version": "sha256:...",
+    "best_prompt_version": "sha256:...",
+    "score_delta": 0.0,
+    "strict_json_delta": 0,
+    "correct_delta": 0,
+    "usable_for_sft_delta": 0
+  },
+  "teacher": {
+    "mode": "api",
+    "model": "your-teacher-model"
+  }
+}
+```
+
+The intended read order is:
+
+1. inspect `question`
+2. inspect the baseline `prompt`
+3. inspect `prompt_teacher_response`
+4. inspect the optimized `best_prompt`
+5. inspect `best_prompt_teacher_response`
+6. inspect `comparison`
+
+## Bootstrap
 
 ```bash
 bash scripts/bootstrap.sh
-bash scripts/step1_smoke.sh
 ```
 
-Optional vendor fetch:
+## Unified Entry Point
+
+The official entrypoint is:
 
 ```bash
-bash scripts/fetch_vendor.sh
+python scripts/scheduler.py
 ```
 
-## MMLU Pool Prep
+If run with no arguments, it executes the default `full-mmlu` pipeline for `v1`:
 
-Prepare normalized MMLU / MMLU-Pro / MMLU-Redux JSONL pools. If the Hugging Face datasets are not cached locally yet, the script will download them automatically through `datasets.load_dataset()`.
+1. prepare the primary MMLU pools
+2. optimize a per-row prompt bundle with GEPA
+3. generate teacher responses for `auxiliary_train` using the per-row prompt bundle
+4. filter to strict JSON rows usable for SFT
+5. export a structured SFT dataset
+6. export the final RWKV training `jsonl`
+7. sample a review subset
+
+To target another dataset version:
 
 ```bash
-python scripts/prepare_mmlu_pools.py
-python scripts/prepare_mmlu_pools.py --only primary
-python scripts/prepare_mmlu_pools.py --include-community
+python scripts/scheduler.py --dataset-version v2
 ```
 
-## MMLU Batch Run
-
-Run the next end-to-end MMLU batch test:
+## Optional Subcommands
 
 ```bash
-bash scripts/step2_mmlu_batch.sh
-python scripts/scheduler.py batch-100
+python scripts/scheduler.py optimize-mmlu --dataset-version v1
+python scripts/scheduler.py generate-mmlu --dataset-version v1
+python scripts/scheduler.py filter-mmlu --dataset-version v1
+python scripts/scheduler.py export-sft --dataset-version v1
+python scripts/scheduler.py export-rwkv --dataset-version v1
+python scripts/scheduler.py sample-review --dataset-version v1
 ```
 
-This step:
-
-1. refreshes the primary MMLU question pools,
-2. optimizes an MMLU teacher system prompt with GEPA on small `dev` / `validation` slices,
-3. generates 100 teacher responses from `mmlu_auxiliary_train`,
-4. writes a random 40-row review sample.
-
-## Full Auxiliary Train Run
-
-Run the first full-pass distillation over all `cais/mmlu` `auxiliary_train` rows:
+Useful overrides:
 
 ```bash
-bash scripts/step3_mmlu_full.sh
-python scripts/scheduler.py full-mmlu
+python scripts/scheduler.py --dataset-version v1 --max-concurrency 6
+python scripts/scheduler.py generate-mmlu --dataset-version v1 --no-resume
+python scripts/scheduler.py full-mmlu --dataset-version v2 --limit 5000
 ```
 
-This step:
+## Default Versioned Outputs
 
-1. checks whether the primary MMLU question pools already exist and only rebuilds them when missing,
-2. optimizes an MMLU teacher system prompt with GEPA,
-3. generates teacher responses for all `auxiliary_train` rows,
-4. filters to the rows whose parsed answer matches the gold label,
-5. exports a compact SFT-ready JSONL dataset,
-6. writes a 40-row review sample from the filtered full dataset.
+For `--dataset-version v1`, the core outputs are:
 
-The scheduler prints stage boundaries, elapsed time, and per-stage progress. During pool download or cache reads you may still see:
+- per-row prompt bundle: `artifacts/v1/mmlu_prompt_bundle.jsonl`
+- raw teacher outputs generated with `best_prompt`: `data/distill/v1/mmlu_batch_all.jsonl`
+- strict filtered rows: `data/distill/v1/mmlu_batch_all_strict.jsonl`
+- structured SFT dataset: `data/distill/v1/mmlu_batch_all_sft.jsonl`
+- final RWKV training dataset: `data/distill/v1/mmlu_batch_all_rwkv.jsonl`
 
-```text
-Warning: You are sending unauthenticated requests to the HF Hub.
-```
+Diagnostics and audit files:
 
-That is only a rate-limit warning. Set `HF_TOKEN` if you want faster Hugging Face downloads.
+- failed generation rows: `artifacts/v1/mmlu_batch_all_failed.jsonl`
+- filter stats: `artifacts/v1/mmlu_batch_all_filter_stats.json`
+- review sample: `artifacts/v1/mmlu_batch_all_review_40.jsonl`
+- prompt report: `artifacts/v1/mmlu_prompt_optimization_report.json`
 
-## Scheduler Commands
+## Current Plan
 
-The Python scheduler is the unified task entrypoint:
+The current pipeline is:
+
+1. run MMLU question pools to build synthetic teacher-answer data
+2. record a baseline teacher answer with the ordinary prompt
+3. run GEPA to optimize that prompt for each target row
+4. record the optimized `best_prompt` and the teacher answer produced with it
+5. keep only rows that are both correct and strict-JSON-valid
+6. export the surviving rows as SFT and RWKV training datasets
+7. fine-tune RWKV in a separate training project
+8. analyze weak domains from the new score report and synthesize the next dataset version
+
+The current implementation uses per-row optimization (`scope = 1`).
+If later you want block optimization such as 100 rows per GEPA run, the main code changes will be:
+
+- add an optimization-scope parameter to the optimizer
+- let the prompt bundle store `scope_size` / `scope_id`
+- let the optimizer report compare block-level metrics in addition to row-level metrics
+- keep row-level `best_prompt` materialization so generation stays simple
+
+## Current Gaps
+
+- The pipeline can measure correctness, JSON validity, and SFT usability, but it still cannot quantify how much reasoning quality improved.
+- The pipeline also cannot tell whether a correct answer was produced with the shortest valid reasoning path.
+
+## Teacher / GEPA API Configuration
+
+The code reads `.env` automatically. Example variables:
 
 ```bash
-python scripts/scheduler.py prepare-pools --only primary
-python scripts/scheduler.py optimize-mmlu
-python scripts/scheduler.py generate-mmlu
-python scripts/scheduler.py batch-100
-python scripts/scheduler.py full-mmlu
+TEACHER_API_KEY=...
+TEACHER_BASE_URL=https://your-openai-compatible-endpoint/v1
+TEACHER_MODEL=gpt-5.2
+
+GEPA_API_KEY=...
+GEPA_BASE_URL=https://your-openai-compatible-endpoint/v1
+GEPA_MODEL=Kimi-K2.5
 ```
 
-Optional flags for the full run:
-
-```bash
-python scripts/scheduler.py full-mmlu --force-pools
-python scripts/scheduler.py full-mmlu --max-concurrency 6
-```
-
-The full run is resumable. If generation is interrupted, running the same command again continues from the existing partial `data/distill/mmlu_batch_all.jsonl`.
-
-## Teacher API configuration
-
-If `TEACHER_MODEL` and `TEACHER_API_KEY` are set, the scripts use a real OpenAI-compatible teacher endpoint through LiteLLM. `TEACHER_BASE_URL` is supported and optional for the official OpenAI API.
-
-If any of those variables are missing, the project automatically falls back to an offline mock teacher so the smoke test still runs.
-
-Optional GEPA reflection configuration for real API mode:
-
-```bash
-export TEACHER_BASE_URL="https://your-openai-compatible-endpoint/v1"
-export TEACHER_API_KEY="your-key"
-export TEACHER_MODEL="gpt-5.2"
-
-export GEPA_BASE_URL="https://your-openai-compatible-endpoint/v1"
-export GEPA_API_KEY="your-gepa-key"
-export GEPA_MODEL="Kimi-K2.5"
-```
-
-If no GEPA reflection model is available, `optimize_prompt.py` falls back to a deterministic local prompt sweep and still produces the required artifacts.
-
-## Outputs
-
-After the smoke test completes, these files should exist:
-
-- `artifacts/best_prompt.txt`
-- `artifacts/optimization_report.json`
-- `data/distill/distill_small.jsonl`
-
-## Next step
-
-Use `train/run_rwkv_peft.sh` or `train/run_rwkv_lm.sh` as the handoff point where `data/distill/mmlu_batch_all_sft.jsonl` can be wired into real RWKV training and preprocessing.
+Teacher generation and GEPA reflection use the official `openai` Python SDK.
+The code automatically selects `responses` or `chat.completions` based on the configured model, and you can
+override that with `TEACHER_API_PROTOCOL` or `GEPA_API_PROTOCOL` if needed.
 
 ## GitHub Upload Checklist
 
@@ -136,8 +223,6 @@ Upload:
 
 - `distill_gepa/`
 - `scripts/`
-- `train/`
-- `configs/`
 - `data/seeds/`
 - `README.md`
 - `pyproject.toml`
@@ -146,8 +231,8 @@ Upload:
 
 Do not upload:
 
-- `.venv/`
 - `.env`
+- `.venv/`
 - `vendor/`
 - `artifacts/`
 - `data/question_pools/`

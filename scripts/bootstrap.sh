@@ -71,6 +71,6 @@ if ! python -m pip --version >/dev/null 2>&1; then
 fi
 
 python -m pip install --upgrade pip
-python -m pip install datasets gepa litellm python-dotenv pyyaml orjson tenacity tqdm
+python -m pip install datasets gepa openai python-dotenv pyyaml orjson tenacity tqdm
 
 echo "Bootstrap complete."
