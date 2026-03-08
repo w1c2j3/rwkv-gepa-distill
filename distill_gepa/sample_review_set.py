@@ -11,7 +11,7 @@ from .common import write_jsonl
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sample a random review subset from a generated JSONL batch.")
+    parser = argparse.ArgumentParser(description="Diagnostics-only: sample a random review subset from a JSONL batch.")
     parser.add_argument("--input-path", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--sample-size", type=int, default=40)
@@ -81,7 +81,8 @@ def main() -> None:
         row = dict(payload)
         meta = dict(row.get("meta", {}))
         meta["review_sample_id"] = review_index
-        meta["source_row_index"] = source_index
+        meta.setdefault("source_row_index", source_index)
+        meta["sample_source_offset"] = source_index
         row["meta"] = meta
         sampled_rows.append(row)
 

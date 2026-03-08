@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import orjson
 
+from .common import write_json
+from .export_sft_dataset import build_sft_row
+from .filter_mmlu_batch import rejection_reason
 from .mmlu_score import score_mcq_response
 from .question_pools import QuestionPoolRecord, iter_question_pool
 from .teacher_client import TeacherClient
@@ -39,8 +44,9 @@ class DistillBatchRecord:
 @dataclass(frozen=True)
 class GeneratedExample:
     index: int
-    record: dict[str, Any]
-    correct: bool
+    raw_record: dict[str, Any]
+    sft_record: dict[str, Any] | None
+    rejection_reason: str
 
 
 @dataclass
@@ -52,7 +58,9 @@ class GenerationJob:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate an MMLU teacher batch from a question pool.")
+    parser = argparse.ArgumentParser(
+        description="Generate MMLU teacher answers from the prompt bundle and write usable rows directly to SFT."
+    )
     parser.add_argument(
         "--question-pool-path",
         type=Path,
@@ -66,12 +74,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-path",
         type=Path,
+        default=Path("data/distill/mmlu_batch_all_sft.jsonl"),
+        help="Primary SFT JSONL output path.",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Also write raw/strict/failure/stats diagnostics alongside the primary SFT output.",
+    )
+    parser.add_argument(
+        "--raw-output-path",
+        type=Path,
         default=Path("data/distill/mmlu_batch_all.jsonl"),
+        help="Diagnostics only: append raw teacher responses here.",
+    )
+    parser.add_argument(
+        "--strict-output-path",
+        type=Path,
+        default=Path("data/distill/mmlu_batch_all_strict.jsonl"),
+        help="Diagnostics only: append strict-filtered rows here.",
     )
     parser.add_argument(
         "--failed-output-path",
         type=Path,
         default=Path("artifacts/mmlu_batch_all_failed.jsonl"),
+        help="Diagnostics only: append exhausted failures here.",
+    )
+    parser.add_argument(
+        "--stats-path",
+        type=Path,
+        default=Path("artifacts/mmlu_batch_all_filter_stats.json"),
+        help="Diagnostics only: write filter stats here.",
     )
     parser.add_argument("--limit", type=int, default=99842)
     parser.add_argument("--max-concurrency", type=int, default=6)
@@ -92,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--no-resume",
         dest="resume",
         action="store_false",
-        help="Restart generation from scratch and overwrite the output and fail files.",
+        help="Restart generation from scratch and overwrite the output and diagnostics files.",
     )
     return parser.parse_args()
 
@@ -127,8 +160,10 @@ def build_generated_example(
         example.answer_index,
         pool_subject=example.subject,
     )
+    score_payload = score.to_dict()
+    reason = rejection_reason(score_payload)
 
-    record = DistillBatchRecord(
+    raw_record = DistillBatchRecord(
         system_prompt=optimized_prompt,
         instruction=example.prompt_text,
         teacher_response=response.content,
@@ -143,13 +178,16 @@ def build_generated_example(
             "pool_subject": example.subject,
             "teacher_subject": score.parsed.subject,
             "subject_match_pool": score.subject_matches_pool,
-            "score": score.to_dict(),
+            "score": score_payload,
         },
-    )
+    ).to_dict()
+
+    sft_record = build_sft_row(raw_record) if reason == "usable_for_sft" else None
     return GeneratedExample(
         index=index,
-        record=record.to_dict(),
-        correct=score.correct,
+        raw_record=raw_record,
+        sft_record=sft_record,
+        rejection_reason=reason,
     )
 
 
@@ -220,24 +258,8 @@ def load_prompt_bundle(prompt_bundle_path: Path) -> dict[int, tuple[str, str]]:
     return prompt_map
 
 
-def processed_index_from_success(payload: dict[str, Any], line_number: int) -> int:
-    meta = payload.get("meta")
-    if not isinstance(meta, dict):
-        raise ValueError(f"Invalid success payload at line {line_number}: missing 'meta'")
-    source_row_index = meta.get("source_row_index")
-    if isinstance(source_row_index, int) and source_row_index >= 0:
-        return source_row_index
-    return line_number - 1
-
-
-def load_success_state(output_path: Path) -> tuple[set[int], int, int]:
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        return set(), 0, 0
-
-    processed_indices: set[int] = set()
-    success_count = 0
-    correct_count = 0
-    with output_path.open("rb") as handle:
+def iter_jsonl_records(path: Path):
+    with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
             if not line:
@@ -245,24 +267,30 @@ def load_success_state(output_path: Path) -> tuple[set[int], int, int]:
             try:
                 payload = orjson.loads(line)
             except orjson.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON in existing output {output_path}:{line_number}") from exc
+                raise ValueError(f"Invalid JSON in {path}:{line_number}") from exc
             if not isinstance(payload, dict):
-                raise ValueError(f"{output_path}:{line_number} must be a JSON object")
-            meta = payload.get("meta")
-            if not isinstance(meta, dict):
-                raise ValueError(f"{output_path}:{line_number} has invalid 'meta'")
-            score = meta.get("score")
-            if not isinstance(score, dict):
-                raise ValueError(f"{output_path}:{line_number} has invalid 'meta.score'")
-            correct = score.get("correct")
-            if not isinstance(correct, bool):
-                raise ValueError(f"{output_path}:{line_number} has invalid 'meta.score.correct'")
+                raise ValueError(f"{path}:{line_number} must be a JSON object")
+            yield line_number, payload
 
-            processed_indices.add(processed_index_from_success(payload, line_number))
-            success_count += 1
-            correct_count += int(correct)
 
-    return processed_indices, success_count, correct_count
+def meta_source_row_index(payload: dict[str, Any], *, source: Path, line_number: int) -> int:
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError(f"{source}:{line_number} has invalid 'meta'")
+    source_row_index = meta.get("source_row_index")
+    if not isinstance(source_row_index, int) or source_row_index < 0:
+        raise ValueError(f"{source}:{line_number} has invalid 'meta.source_row_index'")
+    return source_row_index
+
+
+def load_meta_index_file(path: Path) -> set[int]:
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+
+    processed_indices: set[int] = set()
+    for line_number, payload in iter_jsonl_records(path):
+        processed_indices.add(meta_source_row_index(payload, source=path, line_number=line_number))
+    return processed_indices
 
 
 def processed_index_from_failure(payload: dict[str, Any], line_number: int) -> int:
@@ -277,33 +305,129 @@ def load_failure_indices(failed_output_path: Path) -> set[int]:
         return set()
 
     processed_indices: set[int] = set()
-    with failed_output_path.open("rb") as handle:
-        for line_number, raw_line in enumerate(handle, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                payload = orjson.loads(line)
-            except orjson.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON in existing fail output {failed_output_path}:{line_number}") from exc
-            if not isinstance(payload, dict):
-                raise ValueError(f"{failed_output_path}:{line_number} must be a JSON object")
-            processed_indices.add(processed_index_from_failure(payload, line_number))
+    for line_number, payload in iter_jsonl_records(failed_output_path):
+        processed_indices.add(processed_index_from_failure(payload, line_number))
     return processed_indices
+
+
+def build_strict_record(raw_record: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    if reason != "usable_for_sft":
+        raise ValueError("Strict rows can only be built from usable_for_sft examples")
+
+    meta = raw_record.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError("Raw record is missing object 'meta'")
+
+    score = meta.get("score")
+    if not isinstance(score, dict):
+        raise ValueError("Raw record is missing object 'meta.score'")
+
+    row = dict(raw_record)
+    row["teacher_parsed"] = score.get("parsed", row.get("teacher_parsed"))
+    strict_meta = dict(meta)
+    strict_meta["filter_reason"] = reason
+    strict_meta["output_contract"] = "strict_json_mcq_v1"
+    row["meta"] = strict_meta
+    return row
+
+
+def summarize_raw_diagnostics(raw_output_path: Path) -> tuple[int, int, dict[str, int]]:
+    if not raw_output_path.exists() or raw_output_path.stat().st_size == 0:
+        return 0, 0, {}
+
+    total_rows = 0
+    kept_rows = 0
+    rejection_counts: Counter[str] = Counter()
+    for line_number, payload in iter_jsonl_records(raw_output_path):
+        total_rows += 1
+        meta = payload.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"{raw_output_path}:{line_number} has invalid 'meta'")
+        score = meta.get("score")
+        if not isinstance(score, dict):
+            raise ValueError(f"{raw_output_path}:{line_number} has invalid 'meta.score'")
+        reason = rejection_reason(score)
+        rejection_counts[reason] += 1
+        kept_rows += int(reason == "usable_for_sft")
+
+    return total_rows, kept_rows, dict(sorted(rejection_counts.items()))
+
+
+def write_diagnostic_stats(
+    *,
+    raw_output_path: Path,
+    strict_output_path: Path,
+    stats_path: Path,
+) -> None:
+    total_rows, kept_rows, reason_counts = summarize_raw_diagnostics(raw_output_path)
+    write_json(
+        stats_path,
+        {
+            "input_path": str(raw_output_path),
+            "output_path": str(strict_output_path),
+            "stats_path": str(stats_path),
+            "total_rows": total_rows,
+            "kept_rows": kept_rows,
+            "rejected_rows": total_rows - kept_rows,
+            "reason_counts": reason_counts,
+        },
+    )
+
+
+def reconcile_diagnostic_outputs(
+    *,
+    raw_output_path: Path,
+    strict_output_path: Path,
+    sft_output_path: Path,
+) -> tuple[int, int]:
+    if not raw_output_path.exists() or raw_output_path.stat().st_size == 0:
+        return 0, 0
+
+    repaired_strict_rows = 0
+    repaired_sft_rows = 0
+    strict_indices = load_meta_index_file(strict_output_path)
+    sft_indices = load_meta_index_file(sft_output_path)
+
+    strict_handle: Any | None = None
+    sft_handle: Any | None = None
+    with ExitStack() as stack:
+        for _, payload in iter_jsonl_records(raw_output_path):
+            meta = payload.get("meta")
+            if not isinstance(meta, dict):
+                raise ValueError(f"Invalid diagnostics raw payload in {raw_output_path}")
+            source_row_index = meta.get("source_row_index")
+            if not isinstance(source_row_index, int) or source_row_index < 0:
+                raise ValueError(f"Invalid diagnostics raw payload in {raw_output_path}: missing meta.source_row_index")
+            score = meta.get("score")
+            if not isinstance(score, dict):
+                raise ValueError(f"Invalid diagnostics raw payload in {raw_output_path}: missing meta.score")
+            reason = rejection_reason(score)
+            if reason != "usable_for_sft":
+                continue
+
+            if source_row_index not in strict_indices:
+                if strict_handle is None:
+                    strict_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    strict_mode = "ab" if strict_output_path.exists() and strict_output_path.stat().st_size > 0 else "wb"
+                    strict_handle = stack.enter_context(strict_output_path.open(strict_mode))
+                append_jsonl_line(strict_handle, build_strict_record(payload, reason=reason))
+                strict_indices.add(source_row_index)
+                repaired_strict_rows += 1
+
+            if source_row_index not in sft_indices:
+                if sft_handle is None:
+                    sft_output_path.parent.mkdir(parents=True, exist_ok=True)
+                    sft_mode = "ab" if sft_output_path.exists() and sft_output_path.stat().st_size > 0 else "wb"
+                    sft_handle = stack.enter_context(sft_output_path.open(sft_mode))
+                append_jsonl_line(sft_handle, build_sft_row(payload))
+                sft_indices.add(source_row_index)
+                repaired_sft_rows += 1
+
+    return repaired_strict_rows, repaired_sft_rows
 
 
 def format_job_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
-
-
-def write_success_record(
-    output_handle: Any,
-    generated: GeneratedExample,
-    *,
-    processed_indices: set[int],
-) -> None:
-    append_jsonl_line(output_handle, generated.record)
-    processed_indices.add(generated.index)
 
 
 def make_failed_record(
@@ -359,19 +483,49 @@ def iter_pending_jobs(path: Path, limit: int, processed_indices: set[int]):
         yield GenerationJob(index=index, example=example)
 
 
+def jsonl_file_mode(path: Path, *, resume: bool) -> str:
+    return "ab" if resume and path.exists() and path.stat().st_size > 0 else "wb"
+
+
+def write_generated_records(
+    *,
+    generated: GeneratedExample,
+    sft_handle: Any,
+    diagnostics: bool,
+    raw_handle: Any | None,
+    strict_handle: Any | None,
+) -> bool:
+    if diagnostics:
+        if raw_handle is None or strict_handle is None:
+            raise ValueError("Diagnostics mode requires raw and strict output handles")
+        append_jsonl_line(raw_handle, generated.raw_record)
+    if generated.sft_record is None:
+        return False
+    if diagnostics:
+        append_jsonl_line(
+            strict_handle,
+            build_strict_record(generated.raw_record, reason=generated.rejection_reason),
+        )
+    append_jsonl_line(sft_handle, generated.sft_record)
+    return True
+
+
 def run_retry_round(
     jobs: list[GenerationJob],
     *,
-    output_handle: Any,
-    processed_indices: set[int],
+    sft_handle: Any,
+    diagnostics: bool,
+    raw_handle: Any | None,
+    strict_handle: Any | None,
     prompt_map: dict[int, tuple[str, str]],
     teacher: TeacherClient,
     max_concurrency: int,
-) -> tuple[list[GenerationJob], int]:
+) -> tuple[list[GenerationJob], int, int]:
     if not jobs:
-        return [], 0
+        return [], 0, 0
 
-    resolved_correct = 0
+    resolved_accepted = 0
+    resolved_attempted = 0
     remaining_jobs: list[GenerationJob] = []
     with ThreadPoolExecutor(max_workers=min(max_concurrency, len(jobs))) as executor:
         future_to_job = {
@@ -394,10 +548,18 @@ def run_retry_round(
                     remaining_jobs.append(job)
                     continue
 
-                write_success_record(output_handle, generated, processed_indices=processed_indices)
-                resolved_correct += int(generated.correct)
+                resolved_attempted += 1
+                resolved_accepted += int(
+                    write_generated_records(
+                        generated=generated,
+                        sft_handle=sft_handle,
+                        diagnostics=diagnostics,
+                        raw_handle=raw_handle,
+                        strict_handle=strict_handle,
+                    )
+                )
 
-    return remaining_jobs, resolved_correct
+    return remaining_jobs, resolved_accepted, resolved_attempted
 
 
 def main() -> None:
@@ -424,42 +586,76 @@ def main() -> None:
             "Teacher API is not fully configured. Set TEACHER_MODEL and TEACHER_API_KEY before batch generation."
         )
 
-    if args.resume:
-        success_indices, success_count, correct_count = load_success_state(args.output_path)
-        failed_indices = load_failure_indices(args.failed_output_path)
-        processed_indices = success_indices | failed_indices
-        if success_count or failed_indices:
-            print(f"resume_from={success_count}", flush=True)
-            print(f"resume_failed={len(failed_indices)}", flush=True)
-    else:
-        processed_indices = set()
-        success_count = 0
-        correct_count = 0
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.diagnostics:
+        args.raw_output_path.parent.mkdir(parents=True, exist_ok=True)
+        args.strict_output_path.parent.mkdir(parents=True, exist_ok=True)
+        args.failed_output_path.parent.mkdir(parents=True, exist_ok=True)
+        args.stats_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not args.resume:
         if args.output_path.exists():
             args.output_path.unlink()
-        if args.failed_output_path.exists():
-            args.failed_output_path.unlink()
+        if args.diagnostics:
+            for path in (
+                args.raw_output_path,
+                args.strict_output_path,
+                args.failed_output_path,
+                args.stats_path,
+            ):
+                if path.exists():
+                    path.unlink()
 
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    args.failed_output_path.parent.mkdir(parents=True, exist_ok=True)
+    repaired_strict_rows = 0
+    repaired_sft_rows = 0
+    if args.resume and args.diagnostics:
+        repaired_strict_rows, repaired_sft_rows = reconcile_diagnostic_outputs(
+            raw_output_path=args.raw_output_path,
+            strict_output_path=args.strict_output_path,
+            sft_output_path=args.output_path,
+        )
 
-    pending_jobs = args.limit - len(processed_indices)
-    if pending_jobs <= 0:
-        print("generation_already_complete=true", flush=True)
-        print(f"examples_written={success_count}", flush=True)
-        print(f"failed_examples={len(load_failure_indices(args.failed_output_path))}", flush=True)
-        print(f"output_path={args.output_path}", flush=True)
-        print(f"failed_output_path={args.failed_output_path}", flush=True)
-        return
+    success_indices = load_meta_index_file(args.output_path) if args.resume else set()
+    success_count = len(success_indices)
+    if args.resume and args.diagnostics:
+        raw_indices = load_meta_index_file(args.raw_output_path)
+        failed_indices = load_failure_indices(args.failed_output_path)
+        processed_indices = raw_indices | failed_indices
+        if success_count or raw_indices or failed_indices or repaired_strict_rows or repaired_sft_rows:
+            print(f"resume_sft_rows={success_count}", flush=True)
+            print(f"resume_processed_rows={len(processed_indices)}", flush=True)
+            print(f"resume_failed_rows={len(failed_indices)}", flush=True)
+            if repaired_strict_rows or repaired_sft_rows:
+                print(
+                    f"resume_repaired_strict_rows={repaired_strict_rows} resume_repaired_sft_rows={repaired_sft_rows}",
+                    flush=True,
+                )
+    elif args.resume:
+        processed_indices = set(success_indices)
+        if success_count:
+            print(f"resume_sft_rows={success_count}", flush=True)
+    else:
+        processed_indices = set()
 
     jobs = iter_pending_jobs(args.question_pool_path, args.limit, processed_indices)
     print(f"max_concurrency={args.max_concurrency}", flush=True)
-    print(f"pending_jobs={pending_jobs}", flush=True)
+    print(f"diagnostics={args.diagnostics}", flush=True)
 
     failed_jobs: list[GenerationJob] = []
-    existing_failed_count = len(load_failure_indices(args.failed_output_path))
-    file_mode = "ab" if args.resume and args.output_path.exists() and args.output_path.stat().st_size > 0 else "wb"
-    with args.output_path.open(file_mode) as output_handle:
+    attempted_this_run = 0
+    accepted_this_run = 0
+    with ExitStack() as stack:
+        sft_handle = stack.enter_context(args.output_path.open(jsonl_file_mode(args.output_path, resume=args.resume)))
+        raw_handle: Any | None = None
+        strict_handle: Any | None = None
+        if args.diagnostics:
+            raw_handle = stack.enter_context(
+                args.raw_output_path.open(jsonl_file_mode(args.raw_output_path, resume=args.resume))
+            )
+            strict_handle = stack.enter_context(
+                args.strict_output_path.open(jsonl_file_mode(args.strict_output_path, resume=args.resume))
+            )
+
         with ThreadPoolExecutor(max_workers=args.max_concurrency) as executor:
             future_to_job: dict[Any, GenerationJob] = {}
 
@@ -477,9 +673,25 @@ def main() -> None:
                 future_to_job[future] = job
                 return True
 
-            for _ in range(min(args.max_concurrency, pending_jobs)):
+            for _ in range(args.max_concurrency):
                 if not submit_next():
                     break
+
+            if not future_to_job:
+                print("generation_already_complete=true", flush=True)
+                print(f"examples_written={success_count}", flush=True)
+                if args.diagnostics:
+                    write_diagnostic_stats(
+                        raw_output_path=args.raw_output_path,
+                        strict_output_path=args.strict_output_path,
+                        stats_path=args.stats_path,
+                    )
+                    print(f"raw_output_path={args.raw_output_path}", flush=True)
+                    print(f"strict_output_path={args.strict_output_path}", flush=True)
+                    print(f"failed_output_path={args.failed_output_path}", flush=True)
+                    print(f"stats_path={args.stats_path}", flush=True)
+                print(f"output_path={args.output_path}", flush=True)
+                return
 
             while future_to_job:
                 done, _ = wait(future_to_job.keys(), return_when=FIRST_COMPLETED)
@@ -491,43 +703,53 @@ def main() -> None:
                         job.errors.append(format_job_error(exc))
                         failed_jobs.append(job)
                     else:
-                        write_success_record(output_handle, generated, processed_indices=processed_indices)
-                        success_count += 1
-                        correct_count += int(generated.correct)
+                        attempted_this_run += 1
+                        accepted = write_generated_records(
+                            generated=generated,
+                            sft_handle=sft_handle,
+                            diagnostics=args.diagnostics,
+                            raw_handle=raw_handle,
+                            strict_handle=strict_handle,
+                        )
+                        accepted_this_run += int(accepted)
+                        success_count += int(accepted)
 
-                        if (success_count + existing_failed_count) % args.progress_interval == 0:
-                            print(f"progress={success_count + existing_failed_count}/{args.limit}", flush=True)
+                        if attempted_this_run % args.progress_interval == 0:
+                            print(
+                                f"progress_attempted={attempted_this_run} accepted_total={success_count}",
+                                flush=True,
+                            )
 
                     submit_next()
 
-    if failed_jobs:
-        print(f"initial_failures={len(failed_jobs)}", flush=True)
+        if failed_jobs:
+            print(f"initial_failures={len(failed_jobs)}", flush=True)
 
-    for retry_round in range(1, args.retry_rounds + 1):
-        if not failed_jobs:
-            break
-        print(f"retry_round={retry_round} pending_failures={len(failed_jobs)}", flush=True)
-        with args.output_path.open("ab") as output_handle:
-            failed_jobs, _ = run_retry_round(
+        for retry_round in range(1, args.retry_rounds + 1):
+            if not failed_jobs:
+                break
+            print(f"retry_round={retry_round} pending_failures={len(failed_jobs)}", flush=True)
+            failed_jobs, retry_accepted, retry_attempted = run_retry_round(
                 failed_jobs,
-                output_handle=output_handle,
-                processed_indices=processed_indices,
+                sft_handle=sft_handle,
+                diagnostics=args.diagnostics,
+                raw_handle=raw_handle,
+                strict_handle=strict_handle,
                 prompt_map=prompt_map,
                 teacher=teacher,
                 max_concurrency=args.max_concurrency,
             )
-        _, success_count, correct_count = load_success_state(args.output_path)
-        print(
-            f"retry_round_complete={retry_round} remaining_failures={len(failed_jobs)}",
-            flush=True,
-        )
+            accepted_this_run += retry_accepted
+            attempted_this_run += retry_attempted
+            success_count += retry_accepted
+            print(
+                f"retry_round_complete={retry_round} remaining_failures={len(failed_jobs)} accepted_total={success_count}",
+                flush=True,
+            )
 
     new_failures_written = 0
-    if failed_jobs:
-        fail_file_mode = (
-            "ab" if args.resume and args.failed_output_path.exists() and args.failed_output_path.stat().st_size > 0 else "wb"
-        )
-        with args.failed_output_path.open(fail_file_mode) as fail_handle:
+    if failed_jobs and args.diagnostics:
+        with args.failed_output_path.open(jsonl_file_mode(args.failed_output_path, resume=args.resume)) as fail_handle:
             for job in sorted(failed_jobs, key=lambda item: item.index):
                 append_jsonl_line(
                     fail_handle,
@@ -540,27 +762,32 @@ def main() -> None:
                         teacher=teacher,
                     ),
                 )
-                processed_indices.add(job.index)
                 new_failures_written += 1
 
-    all_failed_indices = load_failure_indices(args.failed_output_path)
-    success_indices, success_count, correct_count = load_success_state(args.output_path)
-    processed_total = len(success_indices | all_failed_indices)
-    if processed_total != args.limit:
-        print(
-            f"warning=processed_total_mismatch processed_total={processed_total} expected_limit={args.limit}",
-            flush=True,
+    failed_count = len(load_failure_indices(args.failed_output_path)) if args.diagnostics else len(failed_jobs)
+    if args.diagnostics:
+        write_diagnostic_stats(
+            raw_output_path=args.raw_output_path,
+            strict_output_path=args.strict_output_path,
+            stats_path=args.stats_path,
         )
-
-    accuracy = round(correct_count / success_count, 6) if success_count else 0.0
+        total_rows, kept_rows, reason_counts = summarize_raw_diagnostics(args.raw_output_path)
+        print(f"diagnostic_total_rows={total_rows}", flush=True)
+        print(f"diagnostic_kept_rows={kept_rows}", flush=True)
+        print(f"diagnostic_reason_counts={orjson.dumps(reason_counts).decode('utf-8')}", flush=True)
 
     print(f"teacher_mode={teacher.mode}", flush=True)
     print(f"examples_written={success_count}", flush=True)
-    print(f"failed_examples={len(all_failed_indices)}", flush=True)
-    print(f"new_failures_written={new_failures_written}", flush=True)
-    print(f"accuracy_vs_gold={accuracy}", flush=True)
+    print(f"attempted_this_run={attempted_this_run}", flush=True)
+    print(f"accepted_this_run={accepted_this_run}", flush=True)
+    print(f"failed_examples={failed_count}", flush=True)
+    if args.diagnostics:
+        print(f"new_failures_written={new_failures_written}", flush=True)
+        print(f"raw_output_path={args.raw_output_path}", flush=True)
+        print(f"strict_output_path={args.strict_output_path}", flush=True)
+        print(f"failed_output_path={args.failed_output_path}", flush=True)
+        print(f"stats_path={args.stats_path}", flush=True)
     print(f"output_path={args.output_path}", flush=True)
-    print(f"failed_output_path={args.failed_output_path}", flush=True)
 
 
 if __name__ == "__main__":

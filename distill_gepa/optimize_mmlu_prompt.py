@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("artifacts/mmlu_prompt_optimization_report.json"),
     )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Write prompt optimization summary diagnostics such as the report JSON.",
+    )
     parser.add_argument("--force-heuristic", action="store_true")
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
@@ -540,7 +545,8 @@ def run_per_row_optimization(
         args.prompt_bundle_path.unlink()
 
     args.prompt_bundle_path.parent.mkdir(parents=True, exist_ok=True)
-    args.report_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.diagnostics:
+        args.report_path.parent.mkdir(parents=True, exist_ok=True)
 
     file_mode = "ab" if args.resume and args.prompt_bundle_path.exists() and args.prompt_bundle_path.stat().st_size > 0 else "wb"
     written_rows = 0
@@ -612,27 +618,28 @@ def run_per_row_optimization(
             if (resumed_rows + written_rows) % args.progress_interval == 0:
                 print(f"progress={resumed_rows + written_rows}", flush=True)
 
-    report_payload = {
-        "optimizer_mode": "per_row_prompt_bundle",
-        "bundle_contract": PROMPT_BUNDLE_CONTRACT,
-        "teacher_mode": teacher.mode,
-        "train_examples": len(train_examples),
-        "question_pool_path": str(args.question_pool_path),
-        "target_limit": args.target_limit,
-        "prompt_bundle_path": str(args.prompt_bundle_path),
-        "report_path": str(args.report_path),
-        "resumed_rows": resumed_rows,
-        "written_rows": written_rows,
-        "total_rows_seen": total_rows_seen,
-        "average_best_score": round(sum(best_scores) / len(best_scores), 6) if best_scores else None,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-    }
-    write_json(args.report_path, report_payload)
     print("optimizer_mode=per_row_prompt_bundle")
     print(f"teacher_mode={teacher.mode}")
     print(f"written_rows={written_rows}")
     print(f"prompt_bundle_path={args.prompt_bundle_path}")
-    print(f"report_path={args.report_path}")
+    if args.diagnostics:
+        report_payload = {
+            "optimizer_mode": "per_row_prompt_bundle",
+            "bundle_contract": PROMPT_BUNDLE_CONTRACT,
+            "teacher_mode": teacher.mode,
+            "train_examples": len(train_examples),
+            "question_pool_path": str(args.question_pool_path),
+            "target_limit": args.target_limit,
+            "prompt_bundle_path": str(args.prompt_bundle_path),
+            "report_path": str(args.report_path),
+            "resumed_rows": resumed_rows,
+            "written_rows": written_rows,
+            "total_rows_seen": total_rows_seen,
+            "average_best_score": round(sum(best_scores) / len(best_scores), 6) if best_scores else None,
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        write_json(args.report_path, report_payload)
+        print(f"report_path={args.report_path}")
 
 
 def main() -> None:

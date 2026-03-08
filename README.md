@@ -4,8 +4,7 @@ Minimal MMLU-focused data pipeline for:
 
 - preparing MMLU question pools from Hugging Face `datasets`
 - optimizing a teacher system prompt with GEPA for each target row
-- generating teacher answers through an OpenAI-compatible API
-- filtering to strict JSON-only SFT rows
+- generating teacher answers through an OpenAI-compatible API and writing usable rows directly to SFT
 - exporting a final RWKV training `jsonl`
 
 This repository is intentionally scoped to data generation and export.
@@ -31,7 +30,7 @@ Rules enforced by the pipeline:
 
 - only raw teacher responses that are already valid JSON can enter SFT
 - parser recovery is allowed for diagnostics only
-- non-JSON rows are kept in raw outputs, but never enter strict SFT or RWKV exports
+- non-JSON rows are kept in raw outputs only when diagnostics are enabled, and never enter SFT or RWKV exports
 - the final RWKV dataset keeps the original teacher JSON string as the assistant target
 
 ## Prompt Bundle Contract
@@ -125,11 +124,8 @@ If run with no arguments, it executes the default `full-mmlu` pipeline for `v1`:
 
 1. prepare the primary MMLU pools
 2. optimize a per-row prompt bundle with GEPA
-3. generate teacher responses for `auxiliary_train` using the per-row prompt bundle
-4. filter to strict JSON rows usable for SFT
-5. export a structured SFT dataset
-6. export the final RWKV training `jsonl`
-7. sample a review subset
+3. generate teacher responses for `auxiliary_train` using the per-row prompt bundle and write usable rows directly to SFT
+4. export the final RWKV training `jsonl`
 
 To target another dataset version:
 
@@ -141,10 +137,18 @@ python scripts/scheduler.py --dataset-version v2
 
 ```bash
 python scripts/scheduler.py optimize-mmlu --dataset-version v1
-python scripts/scheduler.py generate-mmlu --dataset-version v1
+python scripts/scheduler.py generate-sft --dataset-version v1
+python scripts/scheduler.py export-rwkv --dataset-version v1
+```
+
+`generate-mmlu` remains available as a compatibility alias for `generate-sft`.
+
+Diagnostics-only subcommands:
+
+```bash
+python scripts/scheduler.py generate-sft --dataset-version v1 --diagnostics
 python scripts/scheduler.py filter-mmlu --dataset-version v1
 python scripts/scheduler.py export-sft --dataset-version v1
-python scripts/scheduler.py export-rwkv --dataset-version v1
 python scripts/scheduler.py sample-review --dataset-version v1
 ```
 
@@ -152,26 +156,35 @@ Useful overrides:
 
 ```bash
 python scripts/scheduler.py --dataset-version v1 --max-concurrency 6
-python scripts/scheduler.py generate-mmlu --dataset-version v1 --no-resume
+python scripts/scheduler.py generate-sft --dataset-version v1 --no-resume
+python scripts/scheduler.py full-mmlu --dataset-version v1 --diagnostics
 python scripts/scheduler.py full-mmlu --dataset-version v2 --limit 5000
 ```
 
 ## Default Versioned Outputs
 
-For `--dataset-version v1`, the core outputs are:
+For `--dataset-version v1`, the default outputs are only:
 
 - per-row prompt bundle: `artifacts/v1/mmlu_prompt_bundle.jsonl`
-- raw teacher outputs generated with `best_prompt`: `data/distill/v1/mmlu_batch_all.jsonl`
-- strict filtered rows: `data/distill/v1/mmlu_batch_all_strict.jsonl`
 - structured SFT dataset: `data/distill/v1/mmlu_batch_all_sft.jsonl`
 - final RWKV training dataset: `data/distill/v1/mmlu_batch_all_rwkv.jsonl`
 
-Diagnostics and audit files:
+Default day-to-day workflow: inspect the prompt bundle for prompt comparisons, inspect the SFT JSONL as the structured source of truth, and rebuild RWKV from that SFT file when needed.
+
+Resume behavior:
+
+- `mmlu_prompt_bundle.jsonl` is appended row by row and supports `--resume`
+- `mmlu_batch_all_sft.jsonl` is appended row by row and supports `--resume` based on `meta.source_row_index`
+- `mmlu_batch_all_rwkv.jsonl` is rebuilt from the current SFT dataset each run
+
+Only when `--diagnostics` is enabled do these extra audit files appear:
 
 - failed generation rows: `artifacts/v1/mmlu_batch_all_failed.jsonl`
+- raw teacher outputs: `data/distill/v1/mmlu_batch_all.jsonl`
+- strict filtered rows: `data/distill/v1/mmlu_batch_all_strict.jsonl`
 - filter stats: `artifacts/v1/mmlu_batch_all_filter_stats.json`
-- review sample: `artifacts/v1/mmlu_batch_all_review_40.jsonl`
 - prompt report: `artifacts/v1/mmlu_prompt_optimization_report.json`
+- review sample: `artifacts/v1/mmlu_batch_all_review_40.jsonl`
 
 ## Current Plan
 
@@ -181,8 +194,8 @@ The current pipeline is:
 2. record a baseline teacher answer with the ordinary prompt
 3. run GEPA to optimize that prompt for each target row
 4. record the optimized `best_prompt` and the teacher answer produced with it
-5. keep only rows that are both correct and strict-JSON-valid
-6. export the surviving rows as SFT and RWKV training datasets
+5. keep only rows that are both correct and strict-JSON-valid, and write them directly into the SFT dataset
+6. export the surviving SFT rows as the RWKV training dataset
 7. fine-tune RWKV in a separate training project
 8. analyze weak domains from the new score report and synthesize the next dataset version
 

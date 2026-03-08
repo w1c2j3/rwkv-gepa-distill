@@ -1,13 +1,13 @@
 [project]
 name = "rwkv-gepa-distill"
 version = "0.1.0"
-description = "Minimal scaffold for API-teacher GEPA prompt optimization and RWKV distillation"
+description = "Strict-JSON GEPA prompt optimization and RWKV dataset export pipeline"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "datasets",
     "gepa",
-    "litellm",
+    "openai",
     "orjson",
     "python-dotenv",
     "pyyaml",

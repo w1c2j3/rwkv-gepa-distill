@@ -11,7 +11,7 @@ from .mmlu_score import score_mcq_response
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export filtered MMLU teacher rows into a compact SFT-ready JSONL dataset."
+        description="Diagnostics-only: export filtered MMLU teacher rows into a compact SFT-ready JSONL dataset."
     )
     parser.add_argument(
         "--input-path",
@@ -48,6 +48,10 @@ def build_sft_row(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(source_question, dict):
         raise ValueError("Missing object 'source_question'")
 
+    source_row_index = meta.get("source_row_index")
+    if not isinstance(source_row_index, int) or source_row_index < 0:
+        raise ValueError("Missing non-negative integer 'meta.source_row_index'")
+
     choices = source_question.get("choices")
     gold_answer_index = source_question.get("answer_index")
     pool_subject = source_question.get("subject", "")
@@ -76,6 +80,7 @@ def build_sft_row(payload: dict[str, Any]) -> dict[str, Any]:
         "user": instruction,
         "assistant": teacher_response,
         "meta": {
+            "source_row_index": source_row_index,
             "prompt_version": meta.get("prompt_version"),
             "teacher_model": meta.get("teacher_model"),
             "source_dataset": source_question.get("source_dataset"),

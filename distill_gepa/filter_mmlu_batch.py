@@ -13,7 +13,7 @@ from .mmlu_score import score_mcq_response
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Filter generated MMLU teacher rows to keep only strict JSON rows usable for SFT."
+        description="Diagnostics-only: filter generated MMLU teacher rows to keep only strict JSON rows usable for SFT."
     )
     parser.add_argument(
         "--input-path",
