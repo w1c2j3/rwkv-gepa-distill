@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import os
+import re
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import orjson
 from dotenv import load_dotenv
+
+
+ANSWER_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def env_first(*names: str) -> str | None:
@@ -24,6 +29,13 @@ def normalize_api_base(url: str | None) -> str | None:
         if normalized.endswith(suffix):
             normalized = normalized[: -len(suffix)]
     return normalized
+
+
+def api_base_looks_local(url: str | None) -> bool:
+    normalized = normalize_api_base(url)
+    if not normalized:
+        return False
+    return any(token in normalized for token in ("127.0.0.1", "localhost", "0.0.0.0"))
 
 
 def parse_float_env(name: str, default: float) -> float:
@@ -226,20 +238,26 @@ class TeacherConfig:
     timeout_seconds: float = 30.0
     num_retries: int = 0
     prefer_stream: bool = True
+    max_tokens: int | None = 256
+    force_mock: bool = False
 
     @property
     def use_mock(self) -> bool:
-        return not (self.model and self.api_key)
+        return self.force_mock or not bool(self.model)
 
     @classmethod
     def from_env(cls) -> "TeacherConfig":
         load_dotenv()
         model_name = env_first("TEACHER_MODEL")
+        api_base = normalize_api_base(
+            env_first("TEACHER_API_BASE", "TEACHER_BASE_URL", "OPENAI_BASE_URL")
+        )
+        api_key = env_first("TEACHER_API_KEY", "OPENAI_API_KEY")
+        if not api_key and api_base_looks_local(api_base):
+            api_key = "local"
         return cls(
-            api_base=normalize_api_base(
-                env_first("TEACHER_API_BASE", "TEACHER_BASE_URL", "OPENAI_BASE_URL")
-            ),
-            api_key=env_first("TEACHER_API_KEY", "OPENAI_API_KEY"),
+            api_base=api_base,
+            api_key=api_key,
             model=model_name,
             api_protocol=parse_api_protocol(
                 env_first("TEACHER_API_PROTOCOL"),
@@ -248,6 +266,8 @@ class TeacherConfig:
             timeout_seconds=parse_float_env("OPENAI_TIMEOUT", 30.0),
             num_retries=parse_int_env("OPENAI_MAX_RETRIES", 0),
             prefer_stream=parse_bool_env("TEACHER_PREFER_STREAM", False),
+            max_tokens=parse_int_env("OPENAI_MAX_TOKENS", 256),
+            force_mock=False,
         )
 
 
@@ -262,6 +282,7 @@ class TeacherClient:
     def __init__(self, config: TeacherConfig) -> None:
         self.config = config
         self._client: Any | None = None
+        self._async_client: Any | None = None
 
     @classmethod
     def from_env(cls) -> "TeacherClient":
@@ -315,12 +336,31 @@ class TeacherClient:
             ) from exc
 
         self._client = OpenAI(
-            api_key=self.config.api_key,
+            api_key=self.config.api_key or "local",
             base_url=self.config.api_base,
             timeout=self.config.timeout_seconds,
             max_retries=self.config.num_retries,
         )
         return self._client
+
+    def _openai_async_client(self) -> Any:
+        if self._async_client is not None:
+            return self._async_client
+
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "openai is not installed. Run `bash scripts/bootstrap.sh` first."
+            ) from exc
+
+        self._async_client = AsyncOpenAI(
+            api_key=self.config.api_key or "local",
+            base_url=self.config.api_base,
+            timeout=self.config.timeout_seconds,
+            max_retries=self.config.num_retries,
+        )
+        return self._async_client
 
     def _generate_api(
         self,
@@ -339,6 +379,13 @@ class TeacherClient:
 
         return self._generate_api_non_streaming(system_prompt, user_message)
 
+    async def _generate_api_async(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> TeacherResponse:
+        return await self._generate_api_non_streaming_async(system_prompt, user_message)
+
     def _generate_api_non_streaming(
         self,
         system_prompt: str,
@@ -352,6 +399,7 @@ class TeacherClient:
                     {"role": "user", "content": user_message},
                 ],
                 temperature=0,
+                max_tokens=self.config.max_tokens,
             )
             return TeacherResponse(
                 content=extract_chat_completion_text(response),
@@ -364,6 +412,7 @@ class TeacherClient:
             "instructions": system_prompt,
             "input": user_message,
             "temperature": 0,
+            "max_output_tokens": self.config.max_tokens,
         }
         response = self._openai_client().responses.create(**request_kwargs)
         return TeacherResponse(
@@ -385,6 +434,7 @@ class TeacherClient:
             "instructions": system_prompt,
             "input": user_message,
             "temperature": 0,
+            "max_output_tokens": self.config.max_tokens,
         }
         with client.responses.stream(**request_kwargs) as stream:
             final_response = stream.get_final_response()
@@ -394,6 +444,62 @@ class TeacherClient:
             source="teacher_api",
             model_name=self.config.model or "unknown",
         )
+
+    async def _generate_api_non_streaming_async(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> TeacherResponse:
+        if self.config.api_protocol == "chat_completions":
+            response = await self._openai_async_client().chat.completions.create(
+                model=self.config.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_message},
+                ],
+                temperature=0,
+                max_tokens=self.config.max_tokens,
+            )
+            return TeacherResponse(
+                content=extract_chat_completion_text(response),
+                source="teacher_api",
+                model_name=self.config.model or "unknown",
+            )
+
+        response = await self._openai_async_client().responses.create(
+            model=self.config.model,
+            instructions=system_prompt,
+            input=user_message,
+            temperature=0,
+            max_output_tokens=self.config.max_tokens,
+        )
+        return TeacherResponse(
+            content=extract_response_text(response),
+            source="teacher_api",
+            model_name=self.config.model or "unknown",
+        )
+
+    async def generate_from_user_message_async(
+        self,
+        system_prompt: str,
+        user_message: str,
+    ) -> TeacherResponse:
+        if not system_prompt.strip():
+            raise ValueError("System prompt must be non-empty")
+        if not user_message.strip():
+            raise ValueError("User message must be non-empty")
+
+        if self.config.use_mock:
+            return self._generate_mock_from_user_message(system_prompt, user_message)
+        return await self._generate_api_async(system_prompt, user_message)
+
+    async def aclose(self) -> None:
+        if self._async_client is not None:
+            close_method = getattr(self._async_client, "close", None)
+            if close_method is not None:
+                close_result = close_method()
+                if hasattr(close_result, "__await__"):
+                    await close_result
 
     def _generate_mock(
         self,
@@ -445,14 +551,50 @@ class TeacherClient:
         prompt_lower = system_prompt.lower()
         wants_json = "json" in prompt_lower and "answer" in prompt_lower
         wants_mcq = "answer_letter" in prompt_lower or "multiple-choice" in prompt_lower or "multiple choice" in prompt_lower
+        wants_rewrite = "simple_questions" in prompt_lower
+        open_qa_prompt = "question type: open_qa" in user_message.lower()
+        model_name = (self.config.model or "").lower()
 
-        if wants_json and wants_mcq:
+        option_matches = re.findall(r"^[A-Z]\.\s*(.+)$", user_message, re.MULTILINE)
+        if "wrong" in model_name:
+            selected_index = 1 if len(option_matches) > 1 else 0
+        elif "flip" in model_name:
+            digest = hashlib.sha256(user_message.encode("utf-8")).hexdigest()
+            selected_index = int(digest[:8], 16) % max(1, len(option_matches) or 2)
+            if len(option_matches) > 1:
+                selected_index = min(selected_index, 1)
+            else:
+                selected_index = 0
+        else:
+            selected_index = 0
+        selected_letter = ANSWER_LABELS[selected_index] if selected_index < len(ANSWER_LABELS) else "A"
+        selected_text = option_matches[selected_index] if selected_index < len(option_matches) else "Mock answer"
+        open_answer = "Wrong answer" if "wrong" in model_name else "Mock answer"
+
+        if wants_rewrite:
             content = orjson.dumps(
                 {
-                    "answer_letter": "A",
-                    "answer_index": 0,
-                    "answer_text": "Mock answer",
-                    "reasoning": "Offline mock response.",
+                    "simple_questions": [
+                        "Simplified mock question one?",
+                        "Simplified mock question two?",
+                    ]
+                }
+            ).decode("utf-8")
+        elif wants_json and open_qa_prompt:
+            content = orjson.dumps(
+                {
+                    "final_answer": open_answer,
+                    "reasoning": "<think>Offline mock response.</think>",
+                }
+            ).decode("utf-8")
+        elif wants_json and wants_mcq:
+            content = orjson.dumps(
+                {
+                    "final_answer": selected_text,
+                    "answer_letter": selected_letter,
+                    "answer_index": selected_index,
+                    "answer_text": selected_text,
+                    "reasoning": "<think>Offline mock response.</think>",
                 }
             ).decode("utf-8")
         elif wants_json:

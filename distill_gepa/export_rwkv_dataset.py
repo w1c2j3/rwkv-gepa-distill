@@ -6,6 +6,8 @@ from typing import Any
 
 import orjson
 
+from .common import write_json
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -14,13 +16,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-path",
         type=Path,
-        default=Path("data/distill/mmlu_batch_all_sft.jsonl"),
+        default=Path("data/world_knowledge/distill_sft.jsonl"),
     )
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=Path("data/distill/mmlu_batch_all_rwkv.jsonl"),
+        default=Path("data/world_knowledge/distill_rwkv.jsonl"),
     )
+    parser.add_argument("--summary-path", type=Path, default=None)
     parser.add_argument("--progress-interval", type=int, default=5000)
     return parser.parse_args()
 
@@ -76,6 +79,15 @@ def main() -> None:
 
     if total_rows == 0:
         raise ValueError(f"No rows found in {args.input_path}")
+
+    if args.summary_path is not None:
+        summary_payload: dict[str, Any] = {}
+        if args.summary_path.exists() and args.summary_path.stat().st_size > 0:
+            payload = orjson.loads(args.summary_path.read_bytes())
+            if isinstance(payload, dict):
+                summary_payload = payload
+        summary_payload["final_rwkv_row_count"] = total_rows
+        write_json(args.summary_path, summary_payload)
 
     print(f"rows_written={total_rows}", flush=True)
     print(f"output_path={args.output_path}", flush=True)

@@ -73,3 +73,7 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def prompt_version(prompt: str) -> str:
     digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     return f"prompt-{digest[:12]}"
+
+
+def build_shuffle_key(*parts: object) -> str:
+    return "::".join(str(part).strip() for part in parts if str(part).strip())

@@ -1,5 +1,0 @@
-{"instruction":"Describe why a system prompt should request valid JSON.","expected_keywords":["JSON","valid"]}
-{"instruction":"What should a distilled answer include besides being correct?","expected_keywords":["keywords","concise"]}
-{"instruction":"Why is a non-empty answer important for dataset generation?","expected_keywords":["answer","dataset"]}
-{"instruction":"Why do OpenAI-compatible APIs help when swapping teacher endpoints?","expected_keywords":["OpenAI-compatible","endpoint"]}
-{"instruction":"What makes keyword coverage useful for a simple smoke-test scorer?","expected_keywords":["keyword","coverage"]}

@@ -1,5 +1,0 @@
-{"instruction":"Explain gradient descent in one or two sentences.","expected_keywords":["gradient descent","loss"]}
-{"instruction":"What is knowledge distillation in machine learning?","expected_keywords":["teacher","student"]}
-{"instruction":"Expand PEFT and give one reason to use it.","expected_keywords":["parameter-efficient","fine-tuning"]}
-{"instruction":"Why are JSON outputs useful in automation pipelines?","expected_keywords":["JSON","schema"]}
-{"instruction":"Give one reason to keep distillation outputs concise.","expected_keywords":["concise","parsing"]}

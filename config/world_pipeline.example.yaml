@@ -1,0 +1,37 @@
+defaults:
+  api_protocol: chat_completions
+  timeout_seconds: 60
+  num_retries: 2
+  max_tokens: 256
+  prefer_stream: false
+
+base_models:
+  - name: base-model-1
+    model: example-model-1
+    base_url: http://127.0.0.1:8001/v1
+    api_key: local
+  - name: base-model-2
+    model: example-model-2
+    base_url: http://127.0.0.1:8002/v1
+    api_key: local
+  - name: base-model-3
+    model: example-model-3
+    base_url: http://127.0.0.1:8003/v1
+    api_key: local
+  - name: base-model-4
+    model: example-model-4
+    base_url: http://127.0.0.1:8004/v1
+    api_key: local
+    api_protocol: responses
+
+gepa_reflection_model:
+  name: reflection-model
+  model: example-reflection-model
+  base_url: http://127.0.0.1:8010/v1
+  api_key: local
+
+rewrite_model:
+  name: rewrite-model
+  model: example-rewrite-model
+  base_url: http://127.0.0.1:8011/v1
+  api_key: local

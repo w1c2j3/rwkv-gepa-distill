@@ -1,253 +1,88 @@
 # RWKV GEPA Distill
 
-Minimal MMLU-focused data pipeline for:
+World-knowledge synthetic data pipeline for:
 
-- preparing MMLU question pools from Hugging Face `datasets`
-- optimizing a teacher system prompt with GEPA for each target row
-- generating teacher answers through an OpenAI-compatible API and writing usable rows directly to SFT
-- exporting a final RWKV training `jsonl`
+- preparing a unified benchmark pool from dataset TOML files in `config/datasets/`
+- running four base models through an OpenAI-compatible API with repeated shuffled-choice evaluation
+- classifying questions into `direct_distill`, `needs_optimization`, and `suspected_anomaly`
+- optimizing grouped user-side prompts with GEPA for `target_model x domain`
+- rewriting successful complex questions into simpler distillation prompts
+- exporting merged SFT and RWKV datasets
 
-This repository is intentionally scoped to data generation and export.
-Training and evaluation are expected to happen in separate projects.
+All model calls use an OpenAI-compatible API surface. To switch from a remote endpoint to a local model server,
+change the configured `base_url` to `http://127.0.0.1:<port>/v1`.
 
-The official prompt-optimization artifact is only `artifacts/<version>/mmlu_prompt_bundle.jsonl`.
-The old standalone `mmlu_best_prompt.txt` output is no longer part of the pipeline.
+## Config
 
-## Output Contract
+Edit [config/world_pipeline.yaml](/home/chase/GitHub/rwkv-gepa-distill/config/world_pipeline.yaml).
 
-The teacher is optimized to return exactly one valid JSON object with these keys:
+Model roles are separated:
 
-```json
-{
-  "answer_letter": "A",
-  "answer_index": 0,
-  "answer_text": "exact option text",
-  "reasoning": "brief explanation"
-}
-```
+- `base_models`: the four benchmark models
+- `gepa_reflection_model`: the large model used by GEPA
+- `rewrite_model`: the large model used to rewrite complex questions
 
-Rules enforced by the pipeline:
+Each entry uses the same OpenAI-compatible fields:
 
-- only raw teacher responses that are already valid JSON can enter SFT
-- parser recovery is allowed for diagnostics only
-- non-JSON rows are kept in raw outputs only when diagnostics are enabled, and never enter SFT or RWKV exports
-- the final RWKV dataset keeps the original teacher JSON string as the assistant target
+- `name`
+- `model`
+- `base_url`
+- `api_key`
+- `api_protocol`
 
-## Prompt Bundle Contract
+`config/world_pipeline.example.yaml` is the template copy.
 
-Each line of `artifacts/v1/mmlu_prompt_bundle.jsonl` records one full prompt-optimization trace for one question:
+## Pipeline
 
-```json
-{
-  "bundle_contract": "mmlu_prompt_trace_v1",
-  "source_row_index": 17,
-  "question": {
-    "source_dataset": "cais/mmlu",
-    "source_split": "auxiliary_train",
-    "subject": "high_school_biology",
-    "question": "Which organelle is primarily responsible for ATP production?",
-    "choices": [
-      "Ribosome",
-      "Mitochondrion",
-      "Golgi apparatus",
-      "Lysosome"
-    ],
-    "answer": "B",
-    "answer_index": 1,
-    "answer_label": "B",
-    "prompt_text": "Subject: high_school_biology\nQuestion: Which organelle is primarily responsible for ATP production?\nOptions:\nA. Ribosome\nB. Mitochondrion\nC. Golgi apparatus\nD. Lysosome",
-    "meta": {}
-  },
-  "prompt": "original system prompt text",
-  "prompt_version": "sha256:...",
-  "prompt_teacher_response": "{\"answer_letter\":\"B\",\"answer_index\":1,\"answer_text\":\"Mitochondrion\",\"reasoning\":\"Mitochondria are the primary site of aerobic ATP production in eukaryotic cells.\"}",
-  "prompt_score": {
-    "total": 1.0,
-    "valid_json": true,
-    "correct": true,
-    "usable_for_sft": true
-  },
-  "best_prompt": "optimized system prompt text",
-  "best_prompt_version": "sha256:...",
-  "best_prompt_teacher_response": "{\"answer_letter\":\"B\",\"answer_index\":1,\"answer_text\":\"Mitochondrion\",\"reasoning\":\"The mitochondrion generates most ATP through oxidative phosphorylation.\"}",
-  "best_prompt_score": {
-    "total": 1.0,
-    "valid_json": true,
-    "correct": true,
-    "usable_for_sft": true
-  },
-  "optimizer": {
-    "mode": "gepa",
-    "best_score": 1.0,
-    "generated_at_utc": "2026-03-07T12:34:56+00:00"
-  },
-  "comparison": {
-    "prompt_changed": true,
-    "prompt_version": "sha256:...",
-    "best_prompt_version": "sha256:...",
-    "score_delta": 0.0,
-    "strict_json_delta": 0,
-    "correct_delta": 0,
-    "usable_for_sft_delta": 0
-  },
-  "teacher": {
-    "mode": "api",
-    "model": "your-teacher-model"
-  }
-}
-```
-
-The intended read order is:
-
-1. inspect `question`
-2. inspect the baseline `prompt`
-3. inspect `prompt_teacher_response`
-4. inspect the optimized `best_prompt`
-5. inspect `best_prompt_teacher_response`
-6. inspect `comparison`
-
-## Bootstrap
-
-```bash
-bash scripts/bootstrap.sh
-```
-
-## Unified Entry Point
-
-The official entrypoint is:
+The default entrypoint is:
 
 ```bash
 python scripts/scheduler.py
 ```
 
-If run with no arguments, it executes the default `full-mmlu` pipeline for `v1`:
+With no arguments it runs `full-world`, which does:
 
-1. prepare the primary MMLU pools
-2. optimize a per-row prompt bundle with GEPA
-3. generate teacher responses for `auxiliary_train` using the per-row prompt bundle and write usable rows directly to SFT
-4. export the final RWKV training `jsonl`
+1. prepare the dataset declared in `config/datasets/<dataset>.toml`
+2. run four-model repeated evaluation
+3. classify questions
+4. run grouped GEPA user-prompt optimization
+5. rewrite complex GEPA questions into simpler prompts and revalidate them under shuffled choices
+6. merge all distillation sources
+7. export RWKV training jsonl
 
-To target another dataset version:
-
-```bash
-python scripts/scheduler.py --dataset-version v2
-```
-
-## Optional Subcommands
+Useful subcommands:
 
 ```bash
-python scripts/scheduler.py optimize-mmlu --dataset-version v1
-python scripts/scheduler.py generate-sft --dataset-version v1
-python scripts/scheduler.py export-rwkv --dataset-version v1
+python scripts/scheduler.py prepare-world --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py run-benchmark --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py classify-questions --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py optimize-gepa --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py rewrite-questions --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py merge-distill --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py export-rwkv --dataset-name mmlu_auxiliary_train
 ```
 
-`generate-mmlu` remains available as a compatibility alias for `generate-sft`.
+## Default Outputs
 
-Diagnostics-only subcommands:
+For `--dataset-name mmlu_auxiliary_train` the main outputs are:
 
-```bash
-python scripts/scheduler.py generate-sft --dataset-version v1 --diagnostics
-python scripts/scheduler.py filter-mmlu --dataset-version v1
-python scripts/scheduler.py export-sft --dataset-version v1
-python scripts/scheduler.py sample-review --dataset-version v1
-```
+- questions: `data/mmlu_auxiliary_train/questions.jsonl`
+- per-question decisions: `data/mmlu_auxiliary_train/question_decisions.jsonl`
+- GEPA grouped results: `data/mmlu_auxiliary_train/gepa_results.jsonl`
+- rewrite distill rows: `data/mmlu_auxiliary_train/rewrite_distill.jsonl`
+- merged SFT dataset: `data/mmlu_auxiliary_train/distill_sft.jsonl`
+- RWKV dataset: `data/mmlu_auxiliary_train/distill_rwkv.jsonl`
+- pipeline summary: `data/mmlu_auxiliary_train/pipeline_summary.json`
+- cache directory: `data/mmlu_auxiliary_train/cache/`
 
-Useful overrides:
+## Notes
 
-```bash
-python scripts/scheduler.py --dataset-version v1 --max-concurrency 6
-python scripts/scheduler.py generate-sft --dataset-version v1 --no-resume
-python scripts/scheduler.py full-mmlu --dataset-version v1 --diagnostics
-python scripts/scheduler.py full-mmlu --dataset-version v2 --limit 5000
-```
-
-## Default Versioned Outputs
-
-For `--dataset-version v1`, the default outputs are only:
-
-- per-row prompt bundle: `artifacts/v1/mmlu_prompt_bundle.jsonl`
-- structured SFT dataset: `data/distill/v1/mmlu_batch_all_sft.jsonl`
-- final RWKV training dataset: `data/distill/v1/mmlu_batch_all_rwkv.jsonl`
-
-Default day-to-day workflow: inspect the prompt bundle for prompt comparisons, inspect the SFT JSONL as the structured source of truth, and rebuild RWKV from that SFT file when needed.
-
-Resume behavior:
-
-- `mmlu_prompt_bundle.jsonl` is appended row by row and supports `--resume`
-- `mmlu_batch_all_sft.jsonl` is appended row by row and supports `--resume` based on `meta.source_row_index`
-- `mmlu_batch_all_rwkv.jsonl` is rebuilt from the current SFT dataset each run
-
-Only when `--diagnostics` is enabled do these extra audit files appear:
-
-- failed generation rows: `artifacts/v1/mmlu_batch_all_failed.jsonl`
-- raw teacher outputs: `data/distill/v1/mmlu_batch_all.jsonl`
-- strict filtered rows: `data/distill/v1/mmlu_batch_all_strict.jsonl`
-- filter stats: `artifacts/v1/mmlu_batch_all_filter_stats.json`
-- prompt report: `artifacts/v1/mmlu_prompt_optimization_report.json`
-- review sample: `artifacts/v1/mmlu_batch_all_review_40.jsonl`
-
-## Current Plan
-
-The current pipeline is:
-
-1. run MMLU question pools to build synthetic teacher-answer data
-2. record a baseline teacher answer with the ordinary prompt
-3. run GEPA to optimize that prompt for each target row
-4. record the optimized `best_prompt` and the teacher answer produced with it
-5. keep only rows that are both correct and strict-JSON-valid, and write them directly into the SFT dataset
-6. export the surviving SFT rows as the RWKV training dataset
-7. fine-tune RWKV in a separate training project
-8. analyze weak domains from the new score report and synthesize the next dataset version
-
-The current implementation uses per-row optimization (`scope = 1`).
-If later you want block optimization such as 100 rows per GEPA run, the main code changes will be:
-
-- add an optimization-scope parameter to the optimizer
-- let the prompt bundle store `scope_size` / `scope_id`
-- let the optimizer report compare block-level metrics in addition to row-level metrics
-- keep row-level `best_prompt` materialization so generation stays simple
-
-## Current Gaps
-
-- The pipeline can measure correctness, JSON validity, and SFT usability, but it still cannot quantify how much reasoning quality improved.
-- The pipeline also cannot tell whether a correct answer was produced with the shortest valid reasoning path.
-
-## Teacher / GEPA API Configuration
-
-The code reads `.env` automatically. Example variables:
-
-```bash
-TEACHER_API_KEY=...
-TEACHER_BASE_URL=https://your-openai-compatible-endpoint/v1
-TEACHER_MODEL=gpt-5.2
-
-GEPA_API_KEY=...
-GEPA_BASE_URL=https://your-openai-compatible-endpoint/v1
-GEPA_MODEL=Kimi-K2.5
-```
-
-Teacher generation and GEPA reflection use the official `openai` Python SDK.
-The code automatically selects `responses` or `chat.completions` based on the configured model, and you can
-override that with `TEACHER_API_PROTOCOL` or `GEPA_API_PROTOCOL` if needed.
-
-## GitHub Upload Checklist
-
-Upload:
-
-- `distill_gepa/`
-- `scripts/`
-- `data/seeds/`
-- `README.md`
-- `pyproject.toml`
-- `.python-version`
-- `.gitignore`
-
-Do not upload:
-
-- `.env`
-- `.venv/`
-- `vendor/`
-- `artifacts/`
-- `data/question_pools/`
-- `data/eval_pools/`
-- `data/distill/`
+- all multiple-choice model calls use shuffled options, not the source order
+- assistant responses must be strict JSON and keep reasoning inside `<think>...</think>`
+- `direct_distill`: all four base models are stably correct; export additionally requires `<think>`-tagged reasoning
+- `suspected_anomaly`: all four base models are stably wrong
+- `needs_optimization`: anything else enters grouped GEPA optimization
+- grouped GEPA works at `target_model x domain` granularity
+- grouped GEPA keeps the JSON system prompt fixed and searches a user-side prompt prefix
+- rewrite revalidates simple prompts with repeated shuffled-choice checks
+- root dataset folders keep only JSON/JSONL outputs; large intermediate state lives under `data/<dataset>/cache/`

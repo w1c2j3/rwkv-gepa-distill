@@ -13,37 +13,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT_DIR / ".venv" / "bin" / "python"
-KNOWN_COMMANDS = {
-    "prepare-pools",
-    "optimize-mmlu",
-    "generate-sft",
-    "generate-mmlu",
-    "filter-mmlu",
-    "export-sft",
-    "export-rwkv",
-    "sample-review",
-    "full-mmlu",
-}
-
-DEFAULT_DATASET_VERSION = "v1"
-DEFAULT_TRAIN_PATH = Path("data/question_pools/mmlu_dev.jsonl")
-DEFAULT_QUESTION_POOL_PATH = Path("data/question_pools/mmlu_auxiliary_train.jsonl")
-DEFAULT_GEPA_RUN_DIR = Path("artifacts/mmlu_gepa_run")
-DEFAULT_REPORT_PATH = Path("artifacts/mmlu_prompt_optimization_report.json")
-DEFAULT_RAW_OUTPUT_PATH = Path("data/distill/mmlu_batch_all.jsonl")
-DEFAULT_FAILED_OUTPUT_PATH = Path("artifacts/mmlu_batch_all_failed.jsonl")
-DEFAULT_FILTERED_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_strict.jsonl")
-DEFAULT_FILTER_STATS_PATH = Path("artifacts/mmlu_batch_all_filter_stats.json")
-DEFAULT_SFT_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_sft.jsonl")
-DEFAULT_RWKV_OUTPUT_PATH = Path("data/distill/mmlu_batch_all_rwkv.jsonl")
-DEFAULT_REVIEW_OUTPUT_PATH = Path("artifacts/mmlu_batch_all_review_40.jsonl")
-DEFAULT_MAX_METRIC_CALLS = 40
-DEFAULT_LIMIT = 99842
-DEFAULT_MAX_CONCURRENCY = 6
-DEFAULT_GENERATE_PROGRESS = 100
-DEFAULT_STAGE_PROGRESS = 5000
-DEFAULT_SAMPLE_SIZE = 40
-DEFAULT_SAMPLE_SEED = 42
+DEFAULT_DATASET_VERSION = "world_knowledge"
 
 
 @dataclass(frozen=True)
@@ -56,16 +26,18 @@ class TaskSpec:
 @dataclass(frozen=True)
 class DatasetPaths:
     dataset_version: str
+    dataset_dir: Path
+    cache_dir: Path
+    question_path: Path
+    cache_path: Path
+    benchmark_cache_path: Path
+    decision_path: Path
+    gepa_results_path: Path
     gepa_run_dir: Path
-    prompt_bundle_path: Path
-    report_path: Path
-    raw_output_path: Path
-    failed_output_path: Path
-    filtered_output_path: Path
-    filter_stats_path: Path
-    sft_output_path: Path
+    rewrite_output_path: Path
+    merged_sft_path: Path
     rwkv_output_path: Path
-    review_output_path: Path
+    summary_path: Path
 
 
 def default_python() -> str:
@@ -89,36 +61,29 @@ def format_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
-def normalize_dataset_version(dataset_version: str) -> str:
-    normalized = dataset_version.strip()
-    if not normalized:
-        raise ValueError("--dataset-version must be non-empty")
-    return normalized
-
-
 def dataset_paths(dataset_version: str) -> DatasetPaths:
-    normalized = normalize_dataset_version(dataset_version)
-    artifact_dir = Path("artifacts") / normalized
-    distill_dir = Path("data/distill") / normalized
+    dataset_dir = Path("data") / dataset_version
+    cache_dir = dataset_dir / "cache"
     return DatasetPaths(
-        dataset_version=normalized,
-        gepa_run_dir=artifact_dir / "mmlu_gepa_run",
-        prompt_bundle_path=artifact_dir / "mmlu_prompt_bundle.jsonl",
-        report_path=artifact_dir / "mmlu_prompt_optimization_report.json",
-        raw_output_path=distill_dir / "mmlu_batch_all.jsonl",
-        failed_output_path=artifact_dir / "mmlu_batch_all_failed.jsonl",
-        filtered_output_path=distill_dir / "mmlu_batch_all_strict.jsonl",
-        filter_stats_path=artifact_dir / "mmlu_batch_all_filter_stats.json",
-        sft_output_path=distill_dir / "mmlu_batch_all_sft.jsonl",
-        rwkv_output_path=distill_dir / "mmlu_batch_all_rwkv.jsonl",
-        review_output_path=artifact_dir / "mmlu_batch_all_review_40.jsonl",
+        dataset_version=dataset_version,
+        dataset_dir=dataset_dir,
+        cache_dir=cache_dir,
+        question_path=dataset_dir / "questions.jsonl",
+        cache_path=cache_dir / "request_cache.sqlite",
+        benchmark_cache_path=cache_dir / "benchmark_runs.jsonl",
+        decision_path=dataset_dir / "question_decisions.jsonl",
+        gepa_results_path=dataset_dir / "gepa_results.jsonl",
+        gepa_run_dir=cache_dir / "gepa_run",
+        rewrite_output_path=dataset_dir / "rewrite_distill.jsonl",
+        merged_sft_path=dataset_dir / "distill_sft.jsonl",
+        rwkv_output_path=dataset_dir / "distill_rwkv.jsonl",
+        summary_path=dataset_dir / "pipeline_summary.json",
     )
 
 
 def run_tasks(tasks: list[TaskSpec]) -> None:
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
-
     started = time.monotonic()
     total = len(tasks)
     for index, task in enumerate(tasks, start=1):
@@ -131,221 +96,263 @@ def run_tasks(tasks: list[TaskSpec]) -> None:
             f"status=completed task={task.name} elapsed={format_duration(time.monotonic() - task_started)}",
             flush=True,
         )
-
     print(f"pipeline_status=completed elapsed={format_duration(time.monotonic() - started)}", flush=True)
 
 
-def add_prepare_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--force", action="store_true", help="Rebuild primary pools even if cached JSONL exists.")
-    parser.add_argument("--include-community", action="store_true", help="Also build optional community pools.")
-    parser.add_argument("--only", choices=("primary", "eval", "all"), default="primary")
-    parser.add_argument("--limit", type=int, default=None)
-
-
 def add_dataset_version_arg(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset-version", default=DEFAULT_DATASET_VERSION)
+    parser.add_argument("--dataset-version", "--dataset-name", dest="dataset_version", default=DEFAULT_DATASET_VERSION)
 
 
-def add_optimize_args(parser: argparse.ArgumentParser) -> None:
+def add_config_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config-path", type=Path, default=Path("config/world_pipeline.yaml"))
+
+
+def add_prepare_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
-    parser.add_argument("--train-path", type=Path, default=DEFAULT_TRAIN_PATH)
-    parser.add_argument("--question-pool-path", type=Path, default=DEFAULT_QUESTION_POOL_PATH)
-    parser.add_argument("--train-limit", type=int, default=10)
-    parser.add_argument("--target-limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--max-metric-calls", type=int, default=DEFAULT_MAX_METRIC_CALLS)
-    parser.add_argument("--gepa-run-dir", type=Path, default=None)
-    parser.add_argument("--prompt-bundle-path", type=Path, default=None)
-    parser.add_argument("--report-path", type=Path, default=None)
-    parser.add_argument("--diagnostics", action="store_true")
-    parser.add_argument("--fresh-run-dir", action="store_true", default=True)
-    parser.add_argument("--no-fresh-run-dir", dest="fresh_run_dir", action="store_false")
-    parser.add_argument("--resume", action="store_true", default=True)
-    parser.add_argument("--no-resume", dest="resume", action="store_false")
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--force", action="store_true")
 
 
-def add_generate_args(parser: argparse.ArgumentParser) -> None:
+def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
-    parser.add_argument("--question-pool-path", type=Path, default=DEFAULT_QUESTION_POOL_PATH)
-    parser.add_argument("--prompt-bundle-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--diagnostics", action="store_true")
-    parser.add_argument("--raw-output-path", type=Path, default=None)
-    parser.add_argument("--strict-output-path", type=Path, default=None)
-    parser.add_argument("--failed-output-path", type=Path, default=None)
-    parser.add_argument("--stats-path", type=Path, default=None)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
-    parser.add_argument("--retry-rounds", type=int, default=3)
+    add_config_arg(parser)
+    parser.add_argument("--cache-path", type=Path, default=None)
+    parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--samples-per-model", type=int, default=8)
+    parser.add_argument("--max-concurrency", type=int, default=8)
+    parser.add_argument("--model-attempts", type=int, default=2)
+    parser.add_argument("--progress-interval", type=int, default=100)
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
 
 
-def add_filter_args(parser: argparse.ArgumentParser) -> None:
+def add_classify_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
-    parser.add_argument("--input-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--stats-path", type=Path, default=None)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    add_config_arg(parser)
 
 
-def add_export_args(parser: argparse.ArgumentParser) -> None:
+def add_gepa_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
-    parser.add_argument("--input-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    add_config_arg(parser)
+    parser.add_argument("--cache-path", type=Path, default=None)
+    parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("--max-groups", type=int, default=None)
+    parser.add_argument("--max-group-workers", type=int, default=2)
+    parser.add_argument("--max-concurrency", type=int, default=8)
+    parser.add_argument("--max-metric-calls", type=int, default=60)
+    parser.add_argument("--metric-samples", type=int, default=2)
+    parser.add_argument("--materialization-samples", type=int, default=8)
+    parser.add_argument("--model-attempts", type=int, default=2)
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument("--fresh-run-dir", action="store_true")
+
+
+def add_rewrite_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
+    add_config_arg(parser)
+    parser.add_argument("--cache-path", type=Path, default=None)
+    parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("--rewrites-per-example", type=int, default=3)
+    parser.add_argument("--validation-samples", type=int, default=4)
+    parser.add_argument("--model-attempts", type=int, default=2)
+    parser.add_argument("--max-concurrency", type=int, default=8)
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--no-resume", dest="resume", action="store_false")
+
+
+def add_merge_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
 
 
 def add_export_rwkv_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
-    parser.add_argument("--input-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
-
-
-def add_sample_args(parser: argparse.ArgumentParser) -> None:
-    add_dataset_version_arg(parser)
-    parser.add_argument("--input-path", type=Path, default=None)
-    parser.add_argument("--output-path", type=Path, default=None)
-    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
-    parser.add_argument("--seed", type=int, default=DEFAULT_SAMPLE_SEED)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
+    parser.add_argument("--progress-interval", type=int, default=5000)
 
 
 def add_full_args(parser: argparse.ArgumentParser) -> None:
-    add_dataset_version_arg(parser)
-    parser.add_argument("--force-pools", action="store_true")
-    parser.add_argument("--diagnostics", action="store_true")
-    parser.add_argument("--max-concurrency", type=int, default=DEFAULT_MAX_CONCURRENCY)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
-    parser.add_argument("--progress-interval", type=int, default=DEFAULT_GENERATE_PROGRESS)
-    parser.add_argument("--rwkv-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
-    parser.add_argument("--sample-progress-interval", type=int, default=DEFAULT_STAGE_PROGRESS)
-    parser.add_argument("--sample-size", type=int, default=DEFAULT_SAMPLE_SIZE)
-    parser.add_argument("--retry-rounds", type=int, default=3)
+    add_prepare_args(parser)
+    add_config_arg(parser)
+    parser.add_argument("--cache-path", type=Path, default=None)
+    parser.add_argument("--clear-cache", action="store_true")
+    parser.add_argument("--samples-per-model", type=int, default=8)
+    parser.add_argument("--max-concurrency", type=int, default=8)
+    parser.add_argument("--max-group-workers", type=int, default=2)
+    parser.add_argument("--model-attempts", type=int, default=2)
+    parser.add_argument("--progress-interval", type=int, default=100)
+    parser.add_argument("--max-groups", type=int, default=None)
+    parser.add_argument("--max-metric-calls", type=int, default=60)
+    parser.add_argument("--metric-samples", type=int, default=2)
+    parser.add_argument("--materialization-samples", type=int, default=8)
+    parser.add_argument("--rewrites-per-example", type=int, default=3)
+    parser.add_argument("--validation-samples", type=int, default=4)
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
+    parser.add_argument("--fresh-run-dir", action="store_true")
+    parser.add_argument("--rwkv-progress-interval", type=int, default=5000)
+
+
+def resolve_cache_path(args: argparse.Namespace, paths: DatasetPaths) -> Path:
+    cache_path = getattr(args, "cache_path", None)
+    if cache_path is not None:
+        return cache_path
+    return paths.cache_path
 
 
 def prepare_command(args: argparse.Namespace, python_bin: str) -> list[str]:
-    command = [python_bin, "-u", "scripts/prepare_mmlu_pools.py", "--only", args.only]
-    if args.force:
-        command.append("--force")
-    if args.include_community:
-        command.append("--include-community")
+    paths = dataset_paths(args.dataset_version)
+    command = [
+        python_bin,
+        "-u",
+        "scripts/prepare_world_knowledge_pools.py",
+        "--dataset-version",
+        args.dataset_version,
+        "--output-path",
+        str(paths.question_path),
+    ]
     if args.limit is not None:
         command.extend(["--limit", str(args.limit)])
+    if getattr(args, "force", False):
+        command.append("--force")
     return command
 
 
-def optimize_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+def benchmark_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     paths = dataset_paths(args.dataset_version)
     command = [
         python_bin,
         "-u",
         "-m",
-        "distill_gepa.optimize_mmlu_prompt",
-        "--train-path",
-        str(args.train_path),
-        "--question-pool-path",
-        str(args.question_pool_path),
-        "--train-limit",
-        str(args.train_limit),
-        "--target-limit",
-        str(args.target_limit),
-        "--max-metric-calls",
-        str(args.max_metric_calls),
-        "--gepa-run-dir",
-        str(args.gepa_run_dir or paths.gepa_run_dir),
-        "--prompt-bundle-path",
-        str(args.prompt_bundle_path or paths.prompt_bundle_path),
-        "--report-path",
-        str(args.report_path or paths.report_path),
-        "--progress-interval",
-        str(args.progress_interval),
-    ]
-    if args.fresh_run_dir:
-        command.append("--fresh-run-dir")
-    if args.diagnostics:
-        command.append("--diagnostics")
-    if args.resume:
-        command.append("--resume")
-    return command
-
-
-def generate_command(args: argparse.Namespace, python_bin: str) -> list[str]:
-    paths = dataset_paths(args.dataset_version)
-    command = [
-        python_bin,
-        "-u",
-        "-m",
-        "distill_gepa.generate_mmlu_batch",
-        "--question-pool-path",
-        str(args.question_pool_path),
-        "--prompt-bundle-path",
-        str(args.prompt_bundle_path or paths.prompt_bundle_path),
+        "distill_gepa.run_world_benchmark",
+        "--config-path",
+        str(args.config_path),
+        "--question-path",
+        str(paths.question_path),
         "--output-path",
-        str(args.output_path or paths.sft_output_path),
-        "--limit",
-        str(args.limit),
+        str(paths.benchmark_cache_path),
+        "--cache-path",
+        str(resolve_cache_path(args, paths)),
+        "--samples-per-model",
+        str(args.samples_per_model),
         "--max-concurrency",
         str(args.max_concurrency),
         "--progress-interval",
         str(args.progress_interval),
-        "--retry-rounds",
-        str(args.retry_rounds),
+        "--model-attempts",
+        str(args.model_attempts),
     ]
-    if args.diagnostics:
-        command.extend(
-            [
-                "--diagnostics",
-                "--raw-output-path",
-                str(args.raw_output_path or paths.raw_output_path),
-                "--strict-output-path",
-                str(args.strict_output_path or paths.filtered_output_path),
-                "--failed-output-path",
-                str(args.failed_output_path or paths.failed_output_path),
-                "--stats-path",
-                str(args.stats_path or paths.filter_stats_path),
-            ]
-        )
-    if args.resume:
-        command.append("--resume")
+    if getattr(args, "clear_cache", False):
+        command.append("--clear-cache")
+    if args.limit is not None:
+        command.extend(["--limit", str(args.limit)])
+    command.append("--resume" if args.resume else "--no-resume")
     return command
 
 
-def filter_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+def classify_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     paths = dataset_paths(args.dataset_version)
     return [
         python_bin,
         "-u",
         "-m",
-        "distill_gepa.filter_mmlu_batch",
+        "distill_gepa.classify_world_questions",
+        "--config-path",
+        str(args.config_path),
         "--input-path",
-        str(args.input_path or paths.raw_output_path),
+        str(paths.benchmark_cache_path),
         "--output-path",
-        str(args.output_path or paths.filtered_output_path),
-        "--stats-path",
-        str(args.stats_path or paths.filter_stats_path),
-        "--progress-interval",
-        str(args.progress_interval),
+        str(paths.decision_path),
     ]
 
 
-def export_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+def gepa_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    command = [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.optimize_world_prompts",
+        "--config-path",
+        str(args.config_path),
+        "--decision-path",
+        str(paths.decision_path),
+        "--output-path",
+        str(paths.gepa_results_path),
+        "--run-dir",
+        str(paths.gepa_run_dir),
+        "--cache-path",
+        str(resolve_cache_path(args, paths)),
+        "--max-group-workers",
+        str(args.max_group_workers),
+        "--max-concurrency",
+        str(args.max_concurrency),
+        "--max-metric-calls",
+        str(args.max_metric_calls),
+        "--metric-samples",
+        str(args.metric_samples),
+        "--materialization-samples",
+        str(args.materialization_samples),
+        "--model-attempts",
+        str(args.model_attempts),
+    ]
+    if getattr(args, "clear_cache", False):
+        command.append("--clear-cache")
+    if args.max_groups is not None:
+        command.extend(["--max-groups", str(args.max_groups)])
+    if args.fresh_run_dir:
+        command.append("--fresh-run-dir")
+    command.append("--resume" if args.resume else "--no-resume")
+    return command
+
+
+def rewrite_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    command = [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.rewrite_world_questions",
+        "--config-path",
+        str(args.config_path),
+        "--input-path",
+        str(paths.gepa_results_path),
+        "--output-path",
+        str(paths.rewrite_output_path),
+        "--cache-path",
+        str(resolve_cache_path(args, paths)),
+        "--rewrites-per-example",
+        str(args.rewrites_per_example),
+        "--validation-samples",
+        str(args.validation_samples),
+        "--model-attempts",
+        str(args.model_attempts),
+        "--max-concurrency",
+        str(args.max_concurrency),
+    ]
+    if getattr(args, "clear_cache", False):
+        command.append("--clear-cache")
+    command.append("--resume" if args.resume else "--no-resume")
+    return command
+
+
+def merge_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     paths = dataset_paths(args.dataset_version)
     return [
         python_bin,
         "-u",
         "-m",
-        "distill_gepa.export_sft_dataset",
-        "--input-path",
-        str(args.input_path or paths.filtered_output_path),
+        "distill_gepa.merge_world_distill",
+        "--decision-path",
+        str(paths.decision_path),
+        "--gepa-path",
+        str(paths.gepa_results_path),
+        "--rewrite-path",
+        str(paths.rewrite_output_path),
         "--output-path",
-        str(args.output_path or paths.sft_output_path),
-        "--progress-interval",
-        str(args.progress_interval),
+        str(paths.merged_sft_path),
+        "--summary-path",
+        str(paths.summary_path),
     ]
 
 
@@ -357,170 +364,133 @@ def export_rwkv_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "-m",
         "distill_gepa.export_rwkv_dataset",
         "--input-path",
-        str(args.input_path or paths.sft_output_path),
+        str(paths.merged_sft_path),
         "--output-path",
-        str(args.output_path or paths.rwkv_output_path),
+        str(paths.rwkv_output_path),
+        "--summary-path",
+        str(paths.summary_path),
         "--progress-interval",
         str(args.progress_interval),
     ]
 
 
-def sample_command(args: argparse.Namespace, python_bin: str) -> list[str]:
-    paths = dataset_paths(args.dataset_version)
-    return [
-        python_bin,
-        "-u",
-        "-m",
-        "distill_gepa.sample_review_set",
-        "--input-path",
-        str(args.input_path or paths.sft_output_path),
-        "--output-path",
-        str(args.output_path or paths.review_output_path),
-        "--sample-size",
-        str(args.sample_size),
-        "--seed",
-        str(args.seed),
-        "--progress-interval",
-        str(args.progress_interval),
-    ]
-
-
-def build_full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
-    paths = dataset_paths(args.dataset_version)
-    prepare_args = argparse.Namespace(force=args.force_pools, include_community=False, only="primary", limit=None)
-    optimize_args = argparse.Namespace(
+def full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
+    prepare_args = argparse.Namespace(
         dataset_version=args.dataset_version,
-        train_path=DEFAULT_TRAIN_PATH,
-        question_pool_path=DEFAULT_QUESTION_POOL_PATH,
-        train_limit=10,
-        target_limit=args.limit,
-        max_metric_calls=DEFAULT_MAX_METRIC_CALLS,
-        gepa_run_dir=paths.gepa_run_dir,
-        prompt_bundle_path=paths.prompt_bundle_path,
-        report_path=paths.report_path,
-        diagnostics=args.diagnostics,
-        fresh_run_dir=True,
-        resume=args.resume,
-        progress_interval=args.progress_interval,
-    )
-    generate_args = argparse.Namespace(
-        dataset_version=args.dataset_version,
-        question_pool_path=DEFAULT_QUESTION_POOL_PATH,
-        prompt_bundle_path=paths.prompt_bundle_path,
-        output_path=paths.sft_output_path,
-        diagnostics=args.diagnostics,
-        raw_output_path=paths.raw_output_path,
-        strict_output_path=paths.filtered_output_path,
-        failed_output_path=paths.failed_output_path,
-        stats_path=paths.filter_stats_path,
         limit=args.limit,
+        force=args.force,
+    )
+    benchmark_args = argparse.Namespace(
+        dataset_version=args.dataset_version,
+        config_path=args.config_path,
+        cache_path=args.cache_path,
+        clear_cache=args.clear_cache,
+        limit=args.limit,
+        samples_per_model=args.samples_per_model,
         max_concurrency=args.max_concurrency,
+        model_attempts=args.model_attempts,
         progress_interval=args.progress_interval,
-        retry_rounds=args.retry_rounds,
         resume=args.resume,
     )
-    export_rwkv_args = argparse.Namespace(
+    classify_args = argparse.Namespace(dataset_version=args.dataset_version, config_path=args.config_path)
+    gepa_args = argparse.Namespace(
         dataset_version=args.dataset_version,
-        input_path=paths.sft_output_path,
-        output_path=paths.rwkv_output_path,
-        progress_interval=args.rwkv_progress_interval,
+        config_path=args.config_path,
+        cache_path=args.cache_path,
+        clear_cache=False,
+        max_groups=args.max_groups,
+        max_group_workers=args.max_group_workers,
+        max_concurrency=args.max_concurrency,
+        max_metric_calls=args.max_metric_calls,
+        metric_samples=args.metric_samples,
+        materialization_samples=args.materialization_samples,
+        model_attempts=args.model_attempts,
+        resume=args.resume,
+        fresh_run_dir=args.fresh_run_dir,
     )
-    sample_args = argparse.Namespace(
+    rewrite_args = argparse.Namespace(
         dataset_version=args.dataset_version,
-        input_path=paths.sft_output_path,
-        output_path=paths.review_output_path,
-        sample_size=args.sample_size,
-        seed=DEFAULT_SAMPLE_SEED,
-        progress_interval=args.sample_progress_interval,
+        config_path=args.config_path,
+        cache_path=args.cache_path,
+        clear_cache=False,
+        rewrites_per_example=args.rewrites_per_example,
+        validation_samples=args.validation_samples,
+        model_attempts=args.model_attempts,
+        max_concurrency=args.max_concurrency,
+        resume=args.resume,
     )
-    tasks = [
-        TaskSpec("prepare-pools", "Check or build the primary MMLU question pools.", prepare_command(prepare_args, python_bin)),
-        TaskSpec("optimize-mmlu", "Use GEPA to optimize a per-row teacher prompt bundle.", optimize_command(optimize_args, python_bin)),
-        TaskSpec("generate-sft", "Generate teacher responses and write usable rows directly to the SFT JSONL dataset.", generate_command(generate_args, python_bin)),
-        TaskSpec("export-rwkv", "Export the strict SFT rows into the final RWKV training JSONL dataset.", export_rwkv_command(export_rwkv_args, python_bin)),
+    merge_args = argparse.Namespace(dataset_version=args.dataset_version)
+    export_args = argparse.Namespace(dataset_version=args.dataset_version, progress_interval=args.rwkv_progress_interval)
+    return [
+        TaskSpec("prepare-world", "Prepare unified world-knowledge benchmark pools.", prepare_command(prepare_args, python_bin)),
+        TaskSpec("run-benchmark", "Run four-model benchmark evaluation.", benchmark_command(benchmark_args, python_bin)),
+        TaskSpec("classify-questions", "Aggregate benchmark samples into per-question decisions.", classify_command(classify_args, python_bin)),
+        TaskSpec("optimize-gepa", "Optimize per-model same-domain prompts with GEPA and store grouped results.", gepa_command(gepa_args, python_bin)),
+        TaskSpec("rewrite-questions", "Rewrite complex GEPA questions into simpler distillation prompts.", rewrite_command(rewrite_args, python_bin)),
+        TaskSpec("merge-distill", "Merge direct and GEPA-derived distillation datasets.", merge_command(merge_args, python_bin)),
+        TaskSpec("export-rwkv", "Export the merged SFT dataset into RWKV format.", export_rwkv_command(export_args, python_bin)),
     ]
-    if args.diagnostics:
-        tasks.append(TaskSpec("sample-review", "Draw a random review sample from the SFT dataset.", sample_command(sample_args, python_bin)))
-    return tasks
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Unified scheduler for the rwkv-gepa-distill MMLU pipeline.")
+    parser = argparse.ArgumentParser(description="World-knowledge distillation scheduler.")
     subparsers = parser.add_subparsers(dest="command")
 
-    prepare_parser = subparsers.add_parser("prepare-pools", help="Prepare question pools.")
+    prepare_parser = subparsers.add_parser("prepare-world", help="Prepare world benchmark pools.")
     add_prepare_args(prepare_parser)
 
-    optimize_parser = subparsers.add_parser("optimize-mmlu", help="Optimize a per-row teacher prompt bundle with GEPA.")
-    add_optimize_args(optimize_parser)
+    benchmark_parser = subparsers.add_parser("run-benchmark", help="Run the four-model world benchmark.")
+    add_benchmark_args(benchmark_parser)
 
-    generate_parser = subparsers.add_parser(
-        "generate-sft",
-        aliases=["generate-mmlu"],
-        help="Generate teacher answers from the prompt bundle and write usable rows directly to SFT.",
-    )
-    add_generate_args(generate_parser)
+    classify_parser = subparsers.add_parser("classify-questions", help="Classify benchmark questions.")
+    add_classify_args(classify_parser)
 
-    filter_parser = subparsers.add_parser("filter-mmlu", help="Diagnostics-only: filter raw rows to strict JSON rows usable for SFT.")
-    add_filter_args(filter_parser)
+    gepa_parser = subparsers.add_parser("optimize-gepa", help="Run grouped GEPA prompt optimization.")
+    add_gepa_args(gepa_parser)
 
-    export_parser = subparsers.add_parser("export-sft", help="Diagnostics-only: export filtered rows to SFT JSONL.")
-    add_export_args(export_parser)
+    rewrite_parser = subparsers.add_parser("rewrite-questions", help="Rewrite GEPA complex questions.")
+    add_rewrite_args(rewrite_parser)
 
-    export_rwkv_parser = subparsers.add_parser("export-rwkv", help="Export SFT rows to RWKV JSONL.")
-    add_export_rwkv_args(export_rwkv_parser)
+    merge_parser = subparsers.add_parser("merge-distill", help="Merge all distillation datasets.")
+    add_merge_args(merge_parser)
 
-    sample_parser = subparsers.add_parser("sample-review", help="Diagnostics-only: sample a review subset from the SFT dataset.")
-    add_sample_args(sample_parser)
+    export_parser = subparsers.add_parser("export-rwkv", help="Export merged SFT dataset as RWKV text jsonl.")
+    add_export_rwkv_args(export_parser)
 
-    full_parser = subparsers.add_parser("full-mmlu", help="Run the complete default MMLU pipeline.")
+    full_parser = subparsers.add_parser("full-world", help="Run the full world-knowledge distillation pipeline.")
     add_full_args(full_parser)
-
     return parser
 
 
-def parse_scheduler_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
-    argv = sys.argv[1:]
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = build_parser()
     if not argv:
-        return parser.parse_args(["full-mmlu"])
-    if argv[0] in {"-h", "--help"}:
-        return parser.parse_args(argv)
-    if argv[0] in KNOWN_COMMANDS:
-        return parser.parse_args(argv)
-    if argv[0].startswith("-"):
-        return parser.parse_args(["full-mmlu", *argv])
+        return parser.parse_args(["full-world"])
     return parser.parse_args(argv)
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parse_scheduler_args(parser)
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
     python_bin = default_python()
 
-    if args.command == "prepare-pools":
-        tasks = [TaskSpec("prepare-pools", "Prepare normalized MMLU pools.", prepare_command(args, python_bin))]
-    elif args.command == "optimize-mmlu":
-        tasks = [TaskSpec("optimize-mmlu", "Use GEPA to optimize a per-row teacher prompt bundle.", optimize_command(args, python_bin))]
-    elif args.command in {"generate-mmlu", "generate-sft"}:
-        tasks = [
-            TaskSpec(
-                "generate-sft",
-                "Generate teacher responses with the prompt bundle and write usable rows directly to SFT.",
-                generate_command(args, python_bin),
-            )
-        ]
-    elif args.command == "filter-mmlu":
-        tasks = [TaskSpec("filter-mmlu", "Diagnostics-only: filter raw rows to strict JSON rows usable for SFT.", filter_command(args, python_bin))]
-    elif args.command == "export-sft":
-        tasks = [TaskSpec("export-sft", "Diagnostics-only: export filtered rows into the strict SFT dataset.", export_command(args, python_bin))]
+    if args.command == "prepare-world":
+        tasks = [TaskSpec("prepare-world", "Prepare unified world-knowledge benchmark pools.", prepare_command(args, python_bin))]
+    elif args.command == "run-benchmark":
+        tasks = [TaskSpec("run-benchmark", "Run four-model world benchmark evaluation.", benchmark_command(args, python_bin))]
+    elif args.command == "classify-questions":
+        tasks = [TaskSpec("classify-questions", "Classify world benchmark questions.", classify_command(args, python_bin))]
+    elif args.command == "optimize-gepa":
+        tasks = [TaskSpec("optimize-gepa", "Run grouped GEPA prompt optimization.", gepa_command(args, python_bin))]
+    elif args.command == "rewrite-questions":
+        tasks = [TaskSpec("rewrite-questions", "Rewrite complex GEPA prompts into simple prompts.", rewrite_command(args, python_bin))]
+    elif args.command == "merge-distill":
+        tasks = [TaskSpec("merge-distill", "Merge direct and GEPA-derived distillation datasets.", merge_command(args, python_bin))]
     elif args.command == "export-rwkv":
-        tasks = [TaskSpec("export-rwkv", "Export strict SFT rows into the final RWKV dataset.", export_rwkv_command(args, python_bin))]
-    elif args.command == "sample-review":
-        tasks = [TaskSpec("sample-review", "Sample review rows from the SFT dataset.", sample_command(args, python_bin))]
-    elif args.command == "full-mmlu":
-        tasks = build_full_tasks(args, python_bin)
+        tasks = [TaskSpec("export-rwkv", "Export merged SFT as RWKV text.", export_rwkv_command(args, python_bin))]
+    elif args.command == "full-world":
+        tasks = full_tasks(args, python_bin)
     else:
-        raise ValueError(f"Unsupported scheduler command: {args.command}")
+        raise ValueError(f"Unsupported command: {args.command!r}")
 
     run_tasks(tasks)
 

@@ -1,0 +1,15 @@
+name = "mmlu_auxiliary_train"
+merge_output_file = "questions.jsonl"
+
+[[sources]]
+name = "mmlu_auxiliary_train"
+enabled = true
+provider = "huggingface"
+adapter = "cais_mmlu_auxiliary_train"
+output_file = "questions.jsonl"
+merge_into_world = true
+
+[sources.huggingface]
+repo_id = "cais/mmlu"
+config_name = "all"
+revision = "main"

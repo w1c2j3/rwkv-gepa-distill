@@ -1,0 +1,37 @@
+defaults:
+  api_protocol: chat_completions
+  timeout_seconds: 120
+  num_retries: 3
+  max_tokens: 256
+  prefer_stream: false
+
+base_models:
+  - name: glm-5
+    model: GLM-5
+    base_url: https://bobdong.cn/v1
+    api_key_env: GLM5_API_KEY
+  - name: qwen3-max
+    model: Qwen3-Max
+    base_url: https://bobdong.cn/v1
+    api_key_env: QWEN3_MAX_API_KEY
+  - name: grok-4.1
+    model: grok-4.1
+    base_url: https://bobdong.cn/v1
+    api_key_env: GROK41_API_KEY
+  - name: gpt-5.4
+    model: gpt-5.4
+    base_url: https://bobdong.cn/v1
+    api_key_env: GPT54_API_KEY
+    api_protocol: responses
+
+gepa_reflection_model:
+  name: grok-4.1
+  model: grok-4.1
+  base_url: https://bobdong.cn/v1
+  api_key_env: GROK41_API_KEY
+
+rewrite_model:
+  name: claude-haiku-4-5-20251001
+  model: claude-haiku-4-5-20251001
+  base_url: https://bobdong.cn/v1
+  api_key_env: CLAUDE_HAIKU45_API_KEY
