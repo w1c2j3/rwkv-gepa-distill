@@ -6,34 +6,10 @@ defaults:
   prefer_stream: false
 
 base_models:
-  - name: gemini-3-flash-preview
-    model: gemini-3-flash-preview
-    base_url: https://reelxai.com/v1
-    api_key_env: REELXAI_API_KEY
-  - name: gpt-5-2025-08-07
-    model: gpt-5-2025-08-07
-    base_url: https://reelxai.com/v1
-    api_key_env: REELXAI_API_KEY
-    api_protocol: responses
-  - name: claude-sonnet-4-5-20250929
-    model: claude-sonnet-4-5-20250929
-    base_url: https://reelxai.com/v1
-    api_key_env: REELXAI_API_KEY
-  - name: grok-4.2
-    model: grok-4.2
-    base_url: https://reelxai.com/v1
-    api_key_env: REELXAI_API_KEY
+  from_env_collection: ANSWER_MODEL
 
 variant_generator_model:
-  name: gpt-5.4
-  model: gpt-5.4
-  base_url: https://reelxai.com/v1
-  api_key_env: REELXAI_API_KEY
-  api_protocol: responses
+  from_env_prefix: GENERATOR_MODEL
 
 prompt_optimizer_model:
-  name: gpt-5.4
-  model: gpt-5.4
-  base_url: https://reelxai.com/v1
-  api_key_env: REELXAI_API_KEY
-  api_protocol: responses
+  from_env_prefix: OPTIMIZER_MODEL

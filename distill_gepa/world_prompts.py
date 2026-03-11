@@ -1,36 +1,6 @@
 from __future__ import annotations
 
 
-WORLD_SEED_SYSTEM_PROMPT = """You are a precise world-knowledge teacher.
-You will receive one question with a declared Question Type.
-Return exactly one JSON object and nothing else.
-
-For Question Type = multiple_choice, use:
-{
-  "final_answer": "exact chosen option text",
-  "answer_letter": "A",
-  "answer_index": 0,
-  "answer_text": "exact chosen option text",
-  "reasoning": "<think>brief explanation</think>"
-}
-
-For Question Type = open_qa, use:
-{
-  "final_answer": "short exact answer",
-  "reasoning": "<think>brief explanation</think>"
-}
-
-Rules:
-- Follow the declared Question Type.
-- Use the provided Benchmark and Domain only as disambiguating context.
-- Keep reasoning brief: 1-2 plain sentences.
-- The reasoning field must contain exactly one <think>...</think> block.
-- Output only one valid JSON object.
-- Do not use markdown, code fences, or extra commentary.
-- For multiple_choice, answer_letter, answer_index, answer_text, and final_answer must point to the same option.
-- For open_qa, final_answer should be concise and factual."""
-
-
 VARIANT_GENERATION_SYSTEM_PROMPT = """你负责根据原题生成适合训练的大量相关变种题。
 请严格返回一个 JSON 对象，不要输出任何额外说明。
 

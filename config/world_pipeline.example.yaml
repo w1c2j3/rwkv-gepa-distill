@@ -6,25 +6,10 @@ defaults:
   prefer_stream: false
 
 base_models:
-  - name: target-model-1
-    model: target-model-1
-    base_url: https://example.com/v1
-    api_key_env: EXAMPLE_API_KEY
-  - name: target-model-2
-    model: target-model-2
-    base_url: https://example.com/v1
-    api_key_env: EXAMPLE_API_KEY
+  from_env_collection: ANSWER_MODEL
 
 variant_generator_model:
-  name: generator-model
-  model: gpt-5.4
-  base_url: https://example.com/v1
-  api_key_env: EXAMPLE_API_KEY
-  api_protocol: responses
+  from_env_prefix: GENERATOR_MODEL
 
 prompt_optimizer_model:
-  name: optimizer-model
-  model: gpt-5.4
-  base_url: https://example.com/v1
-  api_key_env: EXAMPLE_API_KEY
-  api_protocol: responses
+  from_env_prefix: OPTIMIZER_MODEL

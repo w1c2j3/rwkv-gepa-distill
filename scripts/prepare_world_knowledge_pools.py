@@ -16,9 +16,9 @@ from distill_gepa.world_schema import BenchmarkQuestion, iter_benchmark_question
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Prepare a unified world-knowledge benchmark question pool from config/datasets/<dataset-name>.toml."
+        description="Prepare a benchmark question pool from config/datasets/<dataset-name>.toml."
     )
-    parser.add_argument("--dataset-version", "--dataset-name", dest="dataset_version", default="world_knowledge")
+    parser.add_argument("--dataset-version", "--dataset-name", dest="dataset_version", default="mmlu_auxiliary_train")
     parser.add_argument("--dataset-config-path", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=None, help="Final total number of questions to write.")
     parser.add_argument("--force", action="store_true")

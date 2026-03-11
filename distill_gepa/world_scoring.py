@@ -14,13 +14,6 @@ def normalize_answer_text(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-THINK_TAG_PATTERN = re.compile(r"<think>\s*(?P<content>.*?)\s*</think>", re.IGNORECASE | re.DOTALL)
-
-
-def has_think_tags(value: str) -> bool:
-    return bool(THINK_TAG_PATTERN.search(value))
-
-
 def extract_json_object(raw_text: str) -> dict[str, Any] | None:
     start = raw_text.find("{")
     if start == -1:
@@ -129,7 +122,6 @@ class WorldScoreResult:
     parser_recovered: bool
     answer_present: bool
     reasoning_present: bool
-    think_tags_present: bool
     correct: bool
     usable_for_distill: bool
     exact_answer_text_match: bool
@@ -146,7 +138,6 @@ class WorldScoreResult:
             "parser_recovered": self.parser_recovered,
             "answer_present": self.answer_present,
             "reasoning_present": self.reasoning_present,
-            "think_tags_present": self.think_tags_present,
             "correct": self.correct,
             "usable_for_distill": self.usable_for_distill,
             "exact_answer_text_match": self.exact_answer_text_match,
@@ -295,7 +286,6 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
     parsed = parse_world_response(raw_response, question)
     answer_present = bool(parsed.final_answer or parsed.answer_text or parsed.answer_index is not None)
     reasoning_present = bool(parsed.reasoning.strip())
-    think_tags_present = has_think_tags(parsed.reasoning)
 
     if question.question_type == QUESTION_TYPE_MULTIPLE_CHOICE:
         correct, exact_answer_text_match = _mcq_correct(parsed, question)
@@ -312,7 +302,6 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
         parser_recovered=parsed.parser_recovered,
         answer_present=answer_present,
         reasoning_present=reasoning_present,
-        think_tags_present=think_tags_present,
         correct=correct,
         usable_for_distill=usable_for_distill,
         exact_answer_text_match=exact_answer_text_match,
