@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -155,9 +155,53 @@ class BenchmarkQuestion:
             shuffle_key=effective_shuffle_key,
         )
 
+    def prompted_variant_from_permutation(
+        self,
+        choice_permutation: list[int],
+        *,
+        shuffle_key: str | None = None,
+    ) -> PromptedQuestion:
+        if self.question_type != QUESTION_TYPE_MULTIPLE_CHOICE:
+            return PromptedQuestion(
+                user_message=self.render_prompt(),
+                shuffled_choices=[],
+                shuffled_answer_index=None,
+                choice_permutation=[],
+                shuffle_key=shuffle_key or self.question_id,
+            )
+
+        expected = list(range(len(self.choices)))
+        if sorted(choice_permutation) != expected:
+            raise ValueError(
+                f"{self.question_id} has invalid choice_permutation: {choice_permutation!r}"
+            )
+
+        shuffled_choices = [self.choices[index] for index in choice_permutation]
+        shuffled_answer_index = None
+        if self.gold_answer_index is not None:
+            shuffled_answer_index = choice_permutation.index(self.gold_answer_index)
+
+        return PromptedQuestion(
+            user_message=self.render_prompt(
+                choices=shuffled_choices,
+                gold_answer_index=shuffled_answer_index,
+            ),
+            shuffled_choices=shuffled_choices,
+            shuffled_answer_index=shuffled_answer_index,
+            choice_permutation=list(choice_permutation),
+            shuffle_key=shuffle_key or self.question_id,
+        )
+
+    def scoring_variant_from_permutation(self, choice_permutation: list[int]) -> "BenchmarkQuestion":
+        prompted = self.prompted_variant_from_permutation(choice_permutation)
+        return replace(
+            self,
+            choices=prompted.shuffled_choices,
+            gold_answer_index=prompted.shuffled_answer_index,
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
-            "contract": WORLD_QUESTION_CONTRACT,
             "benchmark_name": self.benchmark_name,
             "split": self.split,
             "domain": self.domain,
@@ -199,6 +243,10 @@ def load_benchmark_questions(path: Path, limit: int | None = None) -> list[Bench
     if not questions:
         raise ValueError(f"No benchmark questions found in {path}")
     return questions
+
+
+def load_benchmark_question_map(path: Path, limit: int | None = None) -> dict[str, BenchmarkQuestion]:
+    return {question.question_id: question for question in iter_benchmark_questions(path, limit=limit)}
 
 
 def write_benchmark_questions(path: Path, questions: Iterable[BenchmarkQuestion]) -> int:

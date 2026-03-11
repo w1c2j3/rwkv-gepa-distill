@@ -1,21 +1,22 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import orjson
 
-from .common import prompt_version, write_json
-
-
-DISTILL_CONTRACT = "distill_row_v1"
+from .common import write_json
+from .trajectory_schema import parse_slot_id
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Merge direct and GEPA-derived distillation datasets.")
+    parser = argparse.ArgumentParser(description="Merge trajectory-first complex and rewrite distillation datasets.")
     parser.add_argument("--decision-path", type=Path, default=Path("data/world_knowledge/question_decisions.jsonl"))
+    parser.add_argument("--benchmark-path", type=Path, default=Path("data/world_knowledge/cache/benchmark_runs.jsonl"))
     parser.add_argument("--gepa-path", type=Path, default=Path("data/world_knowledge/gepa_results.jsonl"))
+    parser.add_argument("--complex-path", type=Path, default=Path("data/world_knowledge/complex_distill.jsonl"))
     parser.add_argument("--rewrite-path", type=Path, default=Path("data/world_knowledge/rewrite_distill.jsonl"))
     parser.add_argument("--output-path", type=Path, default=Path("data/world_knowledge/distill_sft.jsonl"))
     parser.add_argument("--summary-path", type=Path, default=Path("data/world_knowledge/pipeline_summary.json"))
@@ -36,154 +37,130 @@ def iter_jsonl(path: Path):
             yield payload
 
 
-def row_key(payload: dict[str, Any]) -> tuple[str, str, str]:
+def row_key(payload: dict[str, Any]) -> str:
     meta = payload.get("meta")
     if not isinstance(meta, dict):
         raise ValueError("Merged rows require 'meta'")
-    question_id = meta.get("question_id")
-    source_type = payload.get("source_type")
-    user = payload.get("user")
-    if not isinstance(question_id, str) or not isinstance(source_type, str) or not isinstance(user, str):
-        raise ValueError("Merged rows require source_type, user, and meta.question_id")
-    return source_type, question_id, user
-
-
-def build_direct_row(payload: dict[str, Any]) -> dict[str, Any] | None:
-    if payload.get("classification") != "direct_distill":
-        return None
-    question = payload.get("question")
-    preferred_model = payload.get("preferred_model")
-    per_model = payload.get("per_model")
-    if not isinstance(question, dict) or not isinstance(preferred_model, str) or not isinstance(per_model, dict):
-        return None
-    preferred = per_model.get(preferred_model)
-    if not isinstance(preferred, dict):
-        return None
-    if preferred.get("usable_for_direct_distill") is not True:
-        return None
-    system_prompt = preferred.get("preferred_prompt")
-    user_prompt = preferred.get("preferred_instruction")
-    assistant = preferred.get("preferred_response_text")
-    if not isinstance(system_prompt, str) or not isinstance(user_prompt, str) or not isinstance(assistant, str):
-        return None
-    return {
-        "contract": DISTILL_CONTRACT,
-        "source_type": "direct_distill",
-        "system": system_prompt,
-        "user": user_prompt,
-        "assistant": assistant,
-        "meta": {
-            "question_id": question["question_id"],
-            "benchmark_name": question["benchmark_name"],
-            "split": question["split"],
-            "domain": question["domain"],
-            "question_type": question["question_type"],
-            "target_model": preferred_model,
-            "prompt_version": prompt_version(system_prompt),
-            "classification": "direct_distill",
-        },
-    }
-
-
-def iter_complex_rows(path: Path):
-    for payload in iter_jsonl(path) or []:
-        group_id = payload.get("group_id")
-        target_model = payload.get("target_model")
-        domain = payload.get("domain")
-        best_prompt = payload.get("best_prompt")
-        question_deltas = payload.get("question_deltas")
-        if (
-            not isinstance(group_id, str)
-            or not isinstance(target_model, str)
-            or not isinstance(domain, str)
-            or not isinstance(question_deltas, list)
-        ):
-            continue
-        system_prompt = payload.get("system_prompt")
-        if not isinstance(system_prompt, str) or not system_prompt.strip():
-            continue
-        for delta in question_deltas:
-            if not isinstance(delta, dict) or delta.get("improved_to_distillable") is not True:
-                continue
-            question = delta.get("question")
-            user_prompt = delta.get("optimized_preferred_instruction")
-            assistant = delta.get("optimized_preferred_response")
-            question_id = delta.get("question_id")
-            if (
-                not isinstance(question, dict)
-                or not isinstance(user_prompt, str)
-                or not isinstance(assistant, str)
-                or not isinstance(question_id, str)
-            ):
-                continue
-            yield {
-                "contract": DISTILL_CONTRACT,
-                "source_type": "gepa_complex",
-                "system": system_prompt,
-                "user": user_prompt,
-                "assistant": assistant,
-                "meta": {
-                    "question_id": question_id,
-                    "benchmark_name": question["benchmark_name"],
-                    "split": question["split"],
-                    "domain": domain,
-                    "question_type": question["question_type"],
-                    "target_model": target_model,
-                    "group_id": group_id,
-                    "system_prompt_version": prompt_version(system_prompt),
-                    "best_prompt": best_prompt,
-                    "best_prompt_version": prompt_version(best_prompt) if isinstance(best_prompt, str) else None,
-                    "baseline_stable_correct": delta.get("baseline_stable_correct"),
-                    "optimized_stable_correct": delta.get("optimized_stable_correct"),
-                    "baseline_correct_rate": delta.get("baseline_correct_rate"),
-                    "optimized_correct_rate": delta.get("optimized_correct_rate"),
-                    "baseline_think_tag_rate": delta.get("baseline_think_tag_rate"),
-                    "optimized_think_tag_rate": delta.get("optimized_think_tag_rate"),
-                },
-            }
+    trajectory_id = meta.get("trajectory_id")
+    if not isinstance(trajectory_id, str) or not trajectory_id:
+        raise ValueError("Merged rows require meta.trajectory_id")
+    return trajectory_id
 
 
 def build_summary(
     *,
     decision_path: Path,
+    benchmark_path: Path,
     gepa_path: Path,
+    complex_path: Path,
     rewrite_path: Path,
     output_path: Path,
     counts: dict[str, int],
 ) -> dict[str, Any]:
     decision_counts = {"direct_distill": 0, "needs_optimization": 0, "suspected_anomaly": 0}
     question_count = 0
-    base_models: list[str] = []
     for payload in iter_jsonl(decision_path) or []:
         classification = payload.get("classification")
-        per_model = payload.get("per_model")
-        if not base_models and isinstance(per_model, dict):
-            base_models = [key for key in per_model if isinstance(key, str)]
         if isinstance(classification, str) and classification in decision_counts:
             decision_counts[classification] += 1
             question_count += 1
 
+    benchmark_record_count = 0
+    benchmark_correct_record_count = 0
+    for payload in iter_jsonl(benchmark_path) or []:
+        benchmark_record_count += 1
+        if payload.get("correct") is True:
+            benchmark_correct_record_count += 1
+
     gepa_group_count = 0
+    gepa_group_success_count = 0
     gepa_improved_question_count = 0
+    gepa_question_model_pair_count = 0
     for payload in iter_jsonl(gepa_path) or []:
         gepa_group_count += 1
         improved_question_count = payload.get("improved_question_count")
+        question_deltas = payload.get("question_deltas")
         if isinstance(improved_question_count, int):
             gepa_improved_question_count += improved_question_count
+            gepa_group_success_count += int(improved_question_count > 0)
+        if isinstance(question_deltas, list):
+            gepa_question_model_pair_count += sum(1 for item in question_deltas if isinstance(item, dict))
 
-    rewrite_row_count = sum(1 for _ in iter_jsonl(rewrite_path) or [])
+    complex_source_counts: dict[str, int] = defaultdict(int)
+    per_question_complex_counts: dict[str, int] = defaultdict(int)
+    for payload in iter_jsonl(complex_path) or []:
+        source_type = payload.get("source_type")
+        meta = payload.get("meta")
+        slot_id = meta.get("slot_id") if isinstance(meta, dict) else None
+        question_id = None
+        if isinstance(slot_id, str) and slot_id:
+            question_id = parse_slot_id(slot_id).question_id
+        if isinstance(source_type, str):
+            complex_source_counts[source_type] += 1
+        if isinstance(question_id, str):
+            per_question_complex_counts[question_id] += 1
+
+    rewrite_source_counts: dict[str, int] = defaultdict(int)
+    per_question_rewrite_counts: dict[str, int] = defaultdict(int)
+    for payload in iter_jsonl(rewrite_path) or []:
+        source_type = payload.get("source_type")
+        meta = payload.get("meta")
+        slot_id = meta.get("slot_id") if isinstance(meta, dict) else None
+        question_id = None
+        if isinstance(slot_id, str) and slot_id:
+            question_id = parse_slot_id(slot_id).question_id
+        if isinstance(source_type, str):
+            rewrite_source_counts[source_type] += 1
+        if isinstance(question_id, str):
+            per_question_rewrite_counts[question_id] += 1
+
+    per_question_final_counts: dict[str, int] = defaultdict(int)
+    for question_id, count in per_question_complex_counts.items():
+        per_question_final_counts[question_id] += count
+    for question_id, count in per_question_rewrite_counts.items():
+        per_question_final_counts[question_id] += count
+
+    all_question_ids = set(per_question_complex_counts) | set(per_question_rewrite_counts)
+    per_question_complex_row_max = max(per_question_complex_counts.values(), default=0)
+    per_question_rewrite_row_max = max(per_question_rewrite_counts.values(), default=0)
+    per_question_final_row_max = max(per_question_final_counts.values(), default=0)
 
     return {
         "dataset_name": output_path.parent.name,
         "question_count": question_count,
         "decision_counts": decision_counts,
-        "base_models": base_models,
+        "benchmark_record_count": benchmark_record_count,
+        "benchmark_correct_record_count": benchmark_correct_record_count,
         "gepa_group_count": gepa_group_count,
+        "gepa_group_success_count": gepa_group_success_count,
+        "gepa_question_model_pair_count": gepa_question_model_pair_count,
         "gepa_improved_question_count": gepa_improved_question_count,
-        "rewrite_row_count": rewrite_row_count,
+        "gepa_success_rate": round(
+            gepa_improved_question_count / gepa_question_model_pair_count,
+            6,
+        )
+        if gepa_question_model_pair_count
+        else 0.0,
+        "complex_row_count": sum(complex_source_counts.values()),
+        "complex_source_counts": dict(sorted(complex_source_counts.items())),
+        "rewrite_row_count": sum(rewrite_source_counts.values()),
+        "rewrite_source_counts": dict(sorted(rewrite_source_counts.items())),
         "final_sft_row_count": sum(counts.values()),
         "sft_counts": counts,
+        "per_question_complex_row_max": per_question_complex_row_max,
+        "per_question_rewrite_row_max": per_question_rewrite_row_max,
+        "per_question_final_row_max": per_question_final_row_max,
+        "questions_hit_complex_cap_32": sum(1 for count in per_question_complex_counts.values() if count >= 32),
+        "questions_hit_final_cap_128": sum(1 for count in per_question_final_counts.values() if count >= 128),
+        "questions_with_any_training_rows": sum(1 for question_id in all_question_ids if per_question_final_counts[question_id] > 0),
     }
+
+
+def load_existing_summary(path: Path) -> dict[str, Any]:
+    if not path.exists() or path.stat().st_size == 0:
+        return {}
+    payload = orjson.loads(path.read_bytes())
+    return payload if isinstance(payload, dict) else {}
 
 
 def main() -> None:
@@ -191,30 +168,18 @@ def main() -> None:
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     args.summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    counts = {"direct_distill": 0, "gepa_complex": 0, "gepa_rewrite": 0}
-    seen: set[tuple[str, str, str]] = set()
+    counts: dict[str, int] = defaultdict(int)
+    seen: set[str] = set()
 
     with args.output_path.open("wb") as output_handle:
-        for payload in iter_jsonl(args.decision_path) or []:
-            row = build_direct_row(payload)
-            if row is None:
-                continue
-            key = row_key(row)
+        for payload in iter_jsonl(args.complex_path) or []:
+            key = row_key(payload)
             if key in seen:
                 continue
             seen.add(key)
-            output_handle.write(orjson.dumps(row))
+            output_handle.write(orjson.dumps(payload))
             output_handle.write(b"\n")
-            counts["direct_distill"] += 1
-
-        for row in iter_complex_rows(args.gepa_path):
-            key = row_key(row)
-            if key in seen:
-                continue
-            seen.add(key)
-            output_handle.write(orjson.dumps(row))
-            output_handle.write(b"\n")
-            counts["gepa_complex"] += 1
+            counts[str(payload.get("source_type") or "unknown")] += 1
 
         for payload in iter_jsonl(args.rewrite_path) or []:
             key = row_key(payload)
@@ -223,15 +188,22 @@ def main() -> None:
             seen.add(key)
             output_handle.write(orjson.dumps(payload))
             output_handle.write(b"\n")
-            counts["gepa_rewrite"] += 1
+            counts[str(payload.get("source_type") or "unknown")] += 1
 
-    summary = build_summary(
+    computed_summary = build_summary(
         decision_path=args.decision_path,
+        benchmark_path=args.benchmark_path,
         gepa_path=args.gepa_path,
+        complex_path=args.complex_path,
         rewrite_path=args.rewrite_path,
         output_path=args.output_path,
-        counts=counts,
+        counts=dict(sorted(counts.items())),
     )
+    summary = load_existing_summary(args.summary_path)
+    benchmark_storage = summary.get("benchmark_storage")
+    summary.update(computed_summary)
+    if isinstance(benchmark_storage, dict):
+        summary["benchmark_storage"] = benchmark_storage
     write_json(args.summary_path, summary)
     print(f"total_rows={sum(counts.values())}", flush=True)
     print(f"output_path={args.output_path}", flush=True)

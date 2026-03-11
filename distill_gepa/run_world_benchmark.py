@@ -10,14 +10,15 @@ from typing import Any
 import orjson
 
 from .async_request_runner import AsyncRequestRunner
-from .common import build_shuffle_key, prompt_version
+from .common import write_json
 from .model_registry import PipelineModelConfig, load_pipeline_model_config
+from .trajectory_schema import build_slot_shuffle_key
 from .world_prompts import WORLD_SEED_SYSTEM_PROMPT
 from .world_schema import BenchmarkQuestion, iter_benchmark_questions
-from .world_scoring import repair_world_response, score_world_response
+from .world_scoring import score_with_optional_repair
 
 
-BENCHMARK_RUN_CONTRACT = "world_benchmark_run_v1"
+BENCHMARK_MANIFEST_CONTRACT = "world_benchmark_manifest_v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-path", type=Path, default=Path("config/world_pipeline.yaml"))
     parser.add_argument("--question-path", type=Path, default=Path("data/world_knowledge/questions.jsonl"))
     parser.add_argument("--output-path", type=Path, default=Path("data/world_knowledge/cache/benchmark_runs.jsonl"))
+    parser.add_argument("--summary-path", type=Path, default=None)
     parser.add_argument("--cache-path", type=Path, default=None)
     parser.add_argument("--clear-cache", action="store_true")
     parser.add_argument("--limit", type=int, default=None)
@@ -55,12 +57,9 @@ def load_processed_keys(path: Path) -> set[tuple[str, str, int]]:
             payload = orjson.loads(line)
             if not isinstance(payload, dict):
                 raise ValueError(f"{path}:{line_number} must be a JSON object")
-            question = payload.get("question")
+            question_id = payload.get("question_id")
             model_name = payload.get("model_name")
             sample_index = payload.get("sample_index")
-            if not isinstance(question, dict):
-                raise ValueError(f"{path}:{line_number} missing object 'question'")
-            question_id = question.get("question_id")
             if not isinstance(question_id, str) or not isinstance(model_name, str) or not isinstance(sample_index, int):
                 raise ValueError(f"{path}:{line_number} missing resume keys")
             processed.add((question_id, model_name, sample_index))
@@ -69,43 +68,20 @@ def load_processed_keys(path: Path) -> set[tuple[str, str, int]]:
 
 def build_record(
     *,
-    question: BenchmarkQuestion,
+    question_id: str,
     model_name: str,
     sample_index: int,
-    system_prompt: str,
-    user_message: str,
-    raw_response_text: str,
-    effective_response_text: str,
-    score: dict[str, Any],
     choice_permutation: list[int],
-    shuffled_choices: list[str],
-    shuffled_answer_index: int | None,
-    shuffle_key: str,
-    attempt_count: int,
-    cache_hit: bool,
-    generation_errors: list[str],
-    json_repair: dict[str, Any],
+    effective_response_text: str,
+    correct: bool,
 ) -> dict[str, Any]:
     return {
-        "contract": BENCHMARK_RUN_CONTRACT,
-        "question": question.to_dict(),
+        "question_id": question_id,
         "model_name": model_name,
         "sample_index": sample_index,
-        "stage": "benchmark",
-        "system_prompt": system_prompt,
-        "system_prompt_version": prompt_version(system_prompt),
-        "instruction": user_message,
-        "response_text": effective_response_text,
-        "raw_response_text": raw_response_text,
         "choice_permutation": choice_permutation,
-        "shuffled_choices": shuffled_choices,
-        "shuffled_answer_index": shuffled_answer_index,
-        "shuffle_key": shuffle_key,
-        "attempt_count": attempt_count,
-        "cache_hit": cache_hit,
-        "generation_errors": generation_errors,
-        "json_repair": json_repair,
-        "score": score,
+        "assistant": effective_response_text,
+        "correct": correct,
     }
 
 
@@ -120,7 +96,11 @@ async def run_single_eval(
 ) -> dict[str, Any]:
     prompted = question.prompted_variant(
         sample_index,
-        shuffle_key=build_shuffle_key("benchmark", model_name, sample_index),
+        shuffle_key=build_slot_shuffle_key(
+            question_id=question.question_id,
+            target_model=model_name,
+            sample_index=sample_index,
+        ),
     )
     scoring_question = question
     if prompted.shuffled_choices:
@@ -130,59 +110,30 @@ async def run_single_eval(
             gold_answer_index=prompted.shuffled_answer_index,
         )
 
-    def ensure_usable_response(raw_response_text: str) -> None:
-        initial_score = score_world_response(raw_response_text, scoring_question)
-        if initial_score.valid_json and initial_score.think_tags_present:
-            return
-        repaired_response_text, _ = repair_world_response(raw_response_text, scoring_question)
-        if repaired_response_text is None:
-            raise ValueError("benchmark response was neither distill-format-valid nor repairable")
-
     generation = await runner.generate(
         endpoint=config.base_model(model_name),
         system_prompt=WORLD_SEED_SYSTEM_PROMPT,
         user_message=prompted.user_message,
         attempts=model_attempts,
-        validator=ensure_usable_response,
         use_cache=True,
     )
 
     raw_response_text = generation.content
-    effective_response_text = raw_response_text
-    json_repair = {"status": "not_attempted"}
-    score = score_world_response(effective_response_text, scoring_question)
-    if not score.valid_json or not score.think_tags_present:
-        repaired_response_text, json_repair = repair_world_response(raw_response_text, scoring_question)
-        if repaired_response_text is not None:
-            effective_response_text = repaired_response_text
-            score = score_world_response(effective_response_text, scoring_question)
+    effective_response_text, score, _ = score_with_optional_repair(raw_response_text, scoring_question)
 
     return build_record(
-        question=question,
+        question_id=question.question_id,
         model_name=model_name,
         sample_index=sample_index,
-        system_prompt=WORLD_SEED_SYSTEM_PROMPT,
-        user_message=prompted.user_message,
-        raw_response_text=raw_response_text,
-        effective_response_text=effective_response_text,
-        score=score.to_dict(),
         choice_permutation=prompted.choice_permutation,
-        shuffled_choices=prompted.shuffled_choices,
-        shuffled_answer_index=prompted.shuffled_answer_index,
-        shuffle_key=prompted.shuffle_key,
-        attempt_count=generation.attempt_count,
-        cache_hit=generation.cache_hit,
-        generation_errors=generation.errors,
-        json_repair=json_repair,
+        effective_response_text=effective_response_text,
+        correct=score.correct,
     )
 
 
 def summarize_output(path: Path) -> dict[str, Any]:
-    totals_by_model: dict[str, dict[str, int]] = defaultdict(
-        lambda: {"total": 0, "correct": 0, "valid_json": 0, "think_tags": 0, "cache_hits": 0}
-    )
+    totals_by_model: dict[str, dict[str, int]] = defaultdict(lambda: {"total": 0, "correct": 0})
     totals_by_question: dict[str, int] = defaultdict(int)
-    repaired_count = 0
     with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
             line = raw_line.strip()
@@ -192,42 +143,81 @@ def summarize_output(path: Path) -> dict[str, Any]:
             if not isinstance(payload, dict):
                 raise ValueError(f"{path}:{line_number} must be a JSON object")
             model_name = payload.get("model_name")
-            score = payload.get("score")
-            question = payload.get("question")
-            if not isinstance(model_name, str) or not isinstance(score, dict) or not isinstance(question, dict):
+            correct = payload.get("correct")
+            question_id = payload.get("question_id")
+            if not isinstance(model_name, str) or not isinstance(correct, bool) or not isinstance(question_id, str):
                 raise ValueError(f"{path}:{line_number} is missing summary fields")
             totals_by_model[model_name]["total"] += 1
-            totals_by_model[model_name]["correct"] += int(
-                score.get("correct") is True and score.get("valid_json") is True
-            )
-            totals_by_model[model_name]["valid_json"] += int(score.get("valid_json") is True)
-            totals_by_model[model_name]["think_tags"] += int(score.get("think_tags_present") is True)
-            totals_by_model[model_name]["cache_hits"] += int(payload.get("cache_hit") is True)
-            json_repair = payload.get("json_repair")
-            if isinstance(json_repair, dict):
-                repaired_count += int(json_repair.get("status") == "repaired")
-            question_id = question.get("question_id")
-            if isinstance(question_id, str):
-                totals_by_question[question_id] += 1
+            totals_by_model[model_name]["correct"] += int(correct)
+            totals_by_question[question_id] += 1
 
     summary_models: dict[str, Any] = {}
     for model_name, totals in sorted(totals_by_model.items()):
         total = max(1, totals["total"])
         summary_models[model_name] = {
             "total_samples": totals["total"],
-            "correct_and_valid_rate": round(totals["correct"] / total, 6),
-            "valid_json_rate": round(totals["valid_json"] / total, 6),
-            "think_tag_rate": round(totals["think_tags"] / total, 6),
-            "cache_hit_rate": round(totals["cache_hits"] / total, 6),
+            "correct_rate": round(totals["correct"] / total, 6),
         }
 
     return {
         "models": summary_models,
-        "cache_hit_count": sum(item["cache_hits"] for item in totals_by_model.values()),
-        "json_repaired_count": repaired_count,
         "question_count": len(totals_by_question),
         "raw_record_count": sum(item["total_samples"] for item in summary_models.values()),
     }
+
+
+def build_benchmark_storage_summary(
+    *,
+    question_path: Path,
+    question_count: int,
+    config: PipelineModelConfig,
+    samples_per_model: int,
+) -> dict[str, Any]:
+    return {
+        "contract": BENCHMARK_MANIFEST_CONTRACT,
+        "dataset_name": question_path.parent.name,
+        "question_path": str(question_path),
+        "question_count": question_count,
+        "samples_per_model": samples_per_model,
+        "models": [item.name for item in config.base_models],
+        "benchmark_run_fields": [
+            "question_id",
+            "model_name",
+            "sample_index",
+            "choice_permutation",
+            "assistant",
+            "correct",
+        ],
+        "question_bank_fields": [
+            "benchmark_name",
+            "split",
+            "domain",
+            "question_id",
+            "question_type",
+            "question_text",
+            "choices",
+            "gold_answer",
+            "gold_answer_index",
+            "gold_aliases",
+            "metadata",
+        ],
+        "gold_alignment": {
+            "canonical_question_bank": str(question_path),
+            "canonical_gold_answer_index_field": "gold_answer_index",
+            "choice_permutation_field": "choice_permutation",
+            "shuffled_gold_answer_index": "derived_at_runtime_only",
+        },
+    }
+
+
+def write_summary_fragment(path: Path, payload: dict[str, Any]) -> None:
+    summary: dict[str, Any] = {}
+    if path.exists() and path.stat().st_size > 0:
+        loaded = orjson.loads(path.read_bytes())
+        if isinstance(loaded, dict):
+            summary = loaded
+    summary.update(payload)
+    write_json(path, summary)
 
 
 async def run_jobs(
@@ -295,7 +285,7 @@ async def run_jobs(
                     record = await task
                     append_jsonl_line(output_handle, record)
                     total_written += 1
-                    question_id = record["question"]["question_id"]
+                    question_id = record["question_id"]
                     previous_count = completion_counts.get(question_id, 0)
                     current_count = previous_count + 1
                     completion_counts[question_id] = current_count
@@ -334,11 +324,26 @@ async def async_main(args: argparse.Namespace) -> None:
 
     if args.cache_path is None:
         args.cache_path = args.output_path.parent / "request_cache.sqlite"
+    if args.summary_path is None:
+        args.summary_path = args.output_path.parent.parent / "pipeline_summary.json"
     if args.clear_cache and args.cache_path.exists():
         args.cache_path.unlink()
 
     if not args.resume and args.output_path.exists():
         args.output_path.unlink()
+    args.summary_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_summary_fragment(
+        args.summary_path,
+        {
+            "benchmark_storage": build_benchmark_storage_summary(
+                question_path=args.question_path,
+                question_count=len(question_list),
+                config=config,
+                samples_per_model=args.samples_per_model,
+            )
+        },
+    )
 
     processed_keys = load_processed_keys(args.output_path) if args.resume else set()
     completion_counts: dict[str, int] = defaultdict(int)
@@ -374,6 +379,7 @@ async def async_main(args: argparse.Namespace) -> None:
             "samples_per_model": args.samples_per_model,
         }
     )
+    write_summary_fragment(args.summary_path, summary)
     print(f"records_written_this_run={total_written}", flush=True)
     print(f"output_path={args.output_path}", flush=True)
     print(f"questions_completed={completed_questions}/{len(question_list)}", flush=True)

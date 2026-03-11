@@ -14,12 +14,13 @@ from typing import Any, Sequence
 import orjson
 
 from .async_request_runner import AsyncRequestRunner
-from .common import build_shuffle_key, prompt_version, write_json
+from .common import build_shuffle_key, write_json
 from .model_registry import ModelEndpointConfig, load_pipeline_model_config
 from .reflection_lm import make_openai_lm
+from .trajectory_schema import build_slot_shuffle_key
 from .world_prompts import WORLD_GEPA_USER_SEED_PROMPT, WORLD_SEED_SYSTEM_PROMPT
-from .world_schema import BenchmarkQuestion
-from .world_scoring import WorldScoreResult, repair_world_response, score_world_response
+from .world_schema import BenchmarkQuestion, load_benchmark_question_map
+from .world_scoring import WorldScoreResult, score_with_optional_repair
 
 try:
     import gepa.optimize_anything as oa
@@ -29,10 +30,10 @@ except ImportError:
     EngineConfig = GEPAConfig = ReflectionConfig = None
 
 
-GEPA_RESULT_CONTRACT = "gepa_result_v1"
 GEPA_FAILURE_CONTRACT = "gepa_failure_v1"
 GEPA_CHECKPOINT_CONTRACT = "gepa_checkpoint_v1"
 GEPA_CHECKPOINT_FILENAME = "checkpoint.json"
+SLOT_ALIGNED_MATERIALIZATION_MODE = "slot_aligned_v1"
 
 
 @dataclass(frozen=True)
@@ -41,8 +42,6 @@ class SampleOutcome:
     instruction: str
     response_text: str
     score: WorldScoreResult
-    attempt_count: int
-    cache_hit: bool
 
 
 @dataclass(frozen=True)
@@ -50,45 +49,28 @@ class QuestionPromptEvaluation:
     question: BenchmarkQuestion
     stable_correct: bool
     correct_rate: float
-    valid_json_rate: float
-    think_tag_rate: float
     average_score: float
     usable_for_distill_rate: float
-    preferred_sample_index: int
-    preferred_instruction: str
-    preferred_response_text: str
     samples: list[SampleOutcome]
 
     @property
     def composite_score(self) -> float:
         return round(
-            0.55 * float(self.stable_correct)
-            + 0.25 * self.correct_rate
-            + 0.10 * self.think_tag_rate
-            + 0.10 * self.valid_json_rate,
+            0.75 * float(self.stable_correct) + 0.25 * self.correct_rate,
             6,
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "question": self.question.to_dict(),
+            "question_id": self.question.question_id,
             "stable_correct": self.stable_correct,
             "correct_rate": self.correct_rate,
-            "valid_json_rate": self.valid_json_rate,
-            "think_tag_rate": self.think_tag_rate,
-            "average_score": self.average_score,
-            "usable_for_distill_rate": self.usable_for_distill_rate,
-            "preferred_sample_index": self.preferred_sample_index,
-            "preferred_instruction": self.preferred_instruction,
-            "preferred_response_text": self.preferred_response_text,
             "samples": [
                 {
                     "sample_index": item.sample_index,
-                    "instruction": item.instruction,
-                    "response_text": item.response_text,
-                    "attempt_count": item.attempt_count,
-                    "cache_hit": item.cache_hit,
-                    "score": item.score.to_dict(),
+                    "user": item.instruction,
+                    "assistant": item.response_text,
+                    "correct": item.score.correct,
                 }
                 for item in self.samples
             ],
@@ -98,6 +80,7 @@ class QuestionPromptEvaluation:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Optimize grouped world prompts with GEPA.")
     parser.add_argument("--config-path", type=Path, default=Path("config/world_pipeline.yaml"))
+    parser.add_argument("--question-path", type=Path, default=Path("data/world_knowledge/questions.jsonl"))
     parser.add_argument("--decision-path", type=Path, default=Path("data/world_knowledge/question_decisions.jsonl"))
     parser.add_argument("--output-path", type=Path, default=Path("data/world_knowledge/gepa_results.jsonl"))
     parser.add_argument("--failure-path", type=Path, default=None)
@@ -128,7 +111,10 @@ def slugify(value: str) -> str:
     return slug or "group"
 
 
-def load_needs_groups(path: Path) -> dict[tuple[str, str], list[dict[str, Any]]]:
+def load_needs_groups(
+    path: Path,
+    question_payloads_by_id: dict[str, dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     with path.open("rb") as handle:
         for line_number, raw_line in enumerate(handle, start=1):
@@ -139,14 +125,17 @@ def load_needs_groups(path: Path) -> dict[tuple[str, str], list[dict[str, Any]]]
             if not isinstance(payload, dict):
                 raise ValueError(f"{path}:{line_number} must be a JSON object")
             classification = payload.get("classification")
-            question_payload = payload.get("question")
+            question_id = payload.get("question_id")
             per_model = payload.get("per_model")
             if (
                 classification != "needs_optimization"
-                or not isinstance(question_payload, dict)
+                or not isinstance(question_id, str)
                 or not isinstance(per_model, dict)
             ):
                 continue
+            question_payload = question_payloads_by_id.get(question_id)
+            if not isinstance(question_payload, dict):
+                raise ValueError(f"{path}:{line_number} references missing question_id {question_id!r}")
             for model_name, model_summary in per_model.items():
                 if not isinstance(model_summary, dict):
                     continue
@@ -221,19 +210,12 @@ def build_group_checkpoint(
         "question_ids": [question.question_id for question in questions],
         "run_dir": str(run_dir),
         "stage": "initialized",
-        "system_prompt": WORLD_SEED_SYSTEM_PROMPT,
-        "system_prompt_version": prompt_version(WORLD_SEED_SYSTEM_PROMPT),
-        "seed_prompt": WORLD_GEPA_USER_SEED_PROMPT,
-        "seed_prompt_version": prompt_version(WORLD_GEPA_USER_SEED_PROMPT),
+        "materialization_mode": SLOT_ALIGNED_MATERIALIZATION_MODE,
         "best_prompt": None,
-        "best_prompt_version": None,
         "gepa_report": None,
-        "baseline_metrics": None,
         "baseline_evaluations": [],
-        "optimized_metrics": None,
         "optimized_evaluations": [],
         "optimized_progress": {"completed": 0, "total": len(questions)},
-        "question_deltas": [],
         "result_record": None,
         "last_error": None,
     }
@@ -280,10 +262,9 @@ def _rehydrate_questions(question_payloads: Sequence[dict[str, Any]]) -> list[Be
 
 
 def evaluation_question_id(payload: dict[str, Any]) -> str:
-    question = payload.get("question")
-    question_id = question.get("question_id") if isinstance(question, dict) else None
+    question_id = payload.get("question_id")
     if not isinstance(question_id, str) or not question_id:
-        raise ValueError("Evaluation payload is missing question.question_id")
+        raise ValueError("Evaluation payload is missing question_id")
     return question_id
 
 
@@ -319,11 +300,21 @@ async def evaluate_prompt_for_question_async(
     repeats: int,
     model_attempts: int,
     shuffle_namespace: str,
+    slot_aligned: bool = False,
 ) -> QuestionPromptEvaluation:
     async def evaluate_sample(sample_index: int) -> SampleOutcome:
+        shuffle_key = (
+            build_slot_shuffle_key(
+                question_id=question.question_id,
+                target_model=endpoint.name,
+                sample_index=sample_index,
+            )
+            if slot_aligned
+            else build_shuffle_key(shuffle_namespace, sample_index)
+        )
         prompted = question.prompted_variant(
             sample_index,
-            shuffle_key=build_shuffle_key(shuffle_namespace, sample_index),
+            shuffle_key=shuffle_key,
         )
         effective_user_message = render_candidate_user_message(prompt_text, prompted.user_message)
         scoring_question = question
@@ -342,61 +333,32 @@ async def evaluate_prompt_for_question_async(
                 metadata=question.metadata,
             )
 
-        def ensure_usable_response(raw_response_text: str) -> None:
-            initial_score = score_world_response(raw_response_text, scoring_question)
-            if initial_score.valid_json and initial_score.think_tags_present:
-                return
-            repaired_response_text, _ = repair_world_response(raw_response_text, scoring_question)
-            if repaired_response_text is None:
-                raise ValueError("GEPA evaluation response was neither distill-format-valid nor repairable")
-
         generation = await request_runner.generate(
             endpoint=endpoint,
             system_prompt=WORLD_SEED_SYSTEM_PROMPT,
             user_message=effective_user_message,
             attempts=model_attempts,
-            validator=ensure_usable_response,
             use_cache=True,
         )
         response_text = generation.content
-        score = score_world_response(response_text, scoring_question)
-        if not score.valid_json or not score.think_tags_present:
-            repaired_response_text, _ = repair_world_response(response_text, scoring_question)
-            if repaired_response_text is not None:
-                response_text = repaired_response_text
-                score = score_world_response(response_text, scoring_question)
+        response_text, score, _ = score_with_optional_repair(response_text, scoring_question)
 
         return SampleOutcome(
             sample_index=sample_index,
             instruction=effective_user_message,
             response_text=response_text,
             score=score,
-            attempt_count=generation.attempt_count,
-            cache_hit=generation.cache_hit,
         )
 
     samples = list(await asyncio.gather(*[evaluate_sample(sample_index) for sample_index in range(repeats)]))
-    correct_flags = [item.score.correct and item.score.valid_json for item in samples]
-    valid_json_flags = [item.score.valid_json for item in samples]
-    think_tag_flags = [item.score.think_tags_present for item in samples]
-    usable_flags = [item.score.usable_for_distill for item in samples]
-    preferred_sample = next(
-        (item for item in samples if item.score.correct and item.score.valid_json and item.score.think_tags_present),
-        None,
-    )
-    if preferred_sample is None:
-        preferred_sample = next((item for item in samples if item.score.correct and item.score.valid_json), samples[0])
+    correct_flags = [item.score.correct for item in samples]
+    usable_flags = [item.score.correct for item in samples]
     return QuestionPromptEvaluation(
         question=question,
         stable_correct=all(correct_flags),
         correct_rate=round(sum(correct_flags) / len(samples), 6),
-        valid_json_rate=round(sum(valid_json_flags) / len(samples), 6),
-        think_tag_rate=round(sum(think_tag_flags) / len(samples), 6),
         average_score=round(mean(item.score.total for item in samples), 6),
         usable_for_distill_rate=round(sum(usable_flags) / len(samples), 6),
-        preferred_sample_index=preferred_sample.sample_index,
-        preferred_instruction=preferred_sample.instruction,
-        preferred_response_text=preferred_sample.response_text,
         samples=samples,
     )
 
@@ -407,29 +369,20 @@ def aggregate_group_metrics(evaluations: Sequence[QuestionPromptEvaluation]) -> 
             "question_count": 0,
             "stable_correct_rate": 0.0,
             "avg_correct_rate": 0.0,
-            "valid_json_rate": 0.0,
-            "think_tag_rate": 0.0,
             "average_score": 0.0,
             "composite_score": 0.0,
         }
     stable_correct_rate = round(mean(float(item.stable_correct) for item in evaluations), 6)
     avg_correct_rate = round(mean(item.correct_rate for item in evaluations), 6)
-    valid_json_rate = round(mean(item.valid_json_rate for item in evaluations), 6)
-    think_tag_rate = round(mean(item.think_tag_rate for item in evaluations), 6)
     average_score = round(mean(item.average_score for item in evaluations), 6)
     composite_score = round(
-        0.55 * stable_correct_rate
-        + 0.25 * avg_correct_rate
-        + 0.10 * think_tag_rate
-        + 0.10 * valid_json_rate,
+        0.75 * stable_correct_rate + 0.25 * avg_correct_rate,
         6,
     )
     return {
         "question_count": len(evaluations),
         "stable_correct_rate": stable_correct_rate,
         "avg_correct_rate": avg_correct_rate,
-        "valid_json_rate": valid_json_rate,
-        "think_tag_rate": think_tag_rate,
         "average_score": average_score,
         "composite_score": composite_score,
     }
@@ -441,30 +394,18 @@ def aggregate_group_metrics_from_payloads(evaluations: Sequence[dict[str, Any]])
             "question_count": 0,
             "stable_correct_rate": 0.0,
             "avg_correct_rate": 0.0,
-            "valid_json_rate": 0.0,
-            "think_tag_rate": 0.0,
-            "average_score": 0.0,
             "composite_score": 0.0,
         }
     stable_correct_rate = round(mean(float(payload["stable_correct"]) for payload in evaluations), 6)
     avg_correct_rate = round(mean(float(payload["correct_rate"]) for payload in evaluations), 6)
-    valid_json_rate = round(mean(float(payload["valid_json_rate"]) for payload in evaluations), 6)
-    think_tag_rate = round(mean(float(payload["think_tag_rate"]) for payload in evaluations), 6)
-    average_score = round(mean(float(payload["average_score"]) for payload in evaluations), 6)
     composite_score = round(
-        0.55 * stable_correct_rate
-        + 0.25 * avg_correct_rate
-        + 0.10 * think_tag_rate
-        + 0.10 * valid_json_rate,
+        0.75 * stable_correct_rate + 0.25 * avg_correct_rate,
         6,
     )
     return {
         "question_count": len(evaluations),
         "stable_correct_rate": stable_correct_rate,
         "avg_correct_rate": avg_correct_rate,
-        "valid_json_rate": valid_json_rate,
-        "think_tag_rate": think_tag_rate,
-        "average_score": average_score,
         "composite_score": composite_score,
     }
 
@@ -478,6 +419,7 @@ async def evaluate_prompt_on_group_async(
     repeats: int,
     model_attempts: int,
     shuffle_namespace: str,
+    slot_aligned: bool = False,
     completed_evaluations: Sequence[dict[str, Any]] | None = None,
     per_question_callback: Any = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -500,6 +442,7 @@ async def evaluate_prompt_on_group_async(
                 repeats=repeats,
                 model_attempts=model_attempts,
                 shuffle_namespace=shuffle_namespace,
+                slot_aligned=slot_aligned,
             )
         )
         for question in pending_questions
@@ -584,9 +527,8 @@ def run_gepa_for_group(
             "question group with stable correctness across repeated shuffled samples."
         ),
         background=(
-            "Reward stable repeated correctness under shuffled options first, then average correctness, then "
-            "presence of <think>...</think>, then strict JSON compliance. Keep reasoning concise and valid for "
-            "both multiple_choice and open_qa."
+            "Reward stable repeated correctness under shuffled options first, then average correctness. "
+            "Formatting is secondary; optimize for getting the answer right for both multiple_choice and open_qa."
         ),
         config=config,
     )
@@ -610,29 +552,13 @@ def build_question_delta(
     optimized: dict[str, Any],
 ) -> dict[str, Any]:
     improved = (not bool(baseline["stable_correct"])) and bool(optimized["stable_correct"])
-    improved_to_distillable = improved and float(optimized["usable_for_distill_rate"]) >= 1.0 and float(
-        optimized["think_tag_rate"]
-    ) >= 1.0
-    question = optimized["question"]
     return {
-        "question_id": question["question_id"],
-        "question": question,
+        "question_id": optimized["question_id"],
         "improved_to_stable_correct": improved,
-        "improved_to_distillable": improved_to_distillable,
         "baseline_stable_correct": baseline["stable_correct"],
         "optimized_stable_correct": optimized["stable_correct"],
         "baseline_correct_rate": baseline["correct_rate"],
         "optimized_correct_rate": optimized["correct_rate"],
-        "baseline_valid_json_rate": baseline["valid_json_rate"],
-        "optimized_valid_json_rate": optimized["valid_json_rate"],
-        "baseline_think_tag_rate": baseline["think_tag_rate"],
-        "optimized_think_tag_rate": optimized["think_tag_rate"],
-        "baseline_usable_for_distill_rate": baseline["usable_for_distill_rate"],
-        "optimized_usable_for_distill_rate": optimized["usable_for_distill_rate"],
-        "baseline_preferred_response": baseline["preferred_response_text"],
-        "optimized_preferred_response": optimized["preferred_response_text"],
-        "optimized_preferred_instruction": optimized["preferred_instruction"],
-        "preferred_sample_index": optimized["preferred_sample_index"],
     }
 
 
@@ -662,13 +588,10 @@ def build_result_record(
     group_id: str,
     target_model_name: str,
     domain: str,
+    run_dir: Path,
     questions: Sequence[BenchmarkQuestion],
-    best_prompt: str,
-    baseline_metrics: dict[str, Any],
-    optimized_metrics: dict[str, Any],
     baseline_evaluations: Sequence[dict[str, Any]],
     optimized_evaluations: Sequence[dict[str, Any]],
-    gepa_report: dict[str, Any],
 ) -> dict[str, Any]:
     improved_question_count, question_deltas = build_question_deltas(
         questions=questions,
@@ -676,23 +599,13 @@ def build_result_record(
         optimized_evaluations=optimized_evaluations,
     )
     return {
-        "contract": GEPA_RESULT_CONTRACT,
         "group_id": group_id,
         "target_model": target_model_name,
         "domain": domain,
+        "run_dir": str(run_dir),
         "question_count": len(questions),
         "improved_question_count": improved_question_count,
-        "prompt_mode": "user_prefix",
-        "system_prompt": WORLD_SEED_SYSTEM_PROMPT,
-        "system_prompt_version": prompt_version(WORLD_SEED_SYSTEM_PROMPT),
-        "seed_prompt": WORLD_GEPA_USER_SEED_PROMPT,
-        "seed_prompt_version": prompt_version(WORLD_GEPA_USER_SEED_PROMPT),
-        "best_prompt": best_prompt,
-        "best_prompt_version": prompt_version(best_prompt),
-        "baseline_metrics": baseline_metrics,
-        "optimized_metrics": optimized_metrics,
         "question_deltas": question_deltas,
-        "gepa_report": gepa_report,
     }
 
 
@@ -704,8 +617,6 @@ def build_group_job_result(result_record: dict[str, Any]) -> dict[str, Any]:
         "question_count": result_record["question_count"],
         "improved_question_count": result_record["improved_question_count"],
         "result_record": result_record,
-        "baseline_metrics": result_record["baseline_metrics"],
-        "optimized_metrics": result_record["optimized_metrics"],
     }
 
 
@@ -762,7 +673,11 @@ def optimize_group_job(
         write_group_checkpoint(checkpoint_path, checkpoint)
 
     completed_result = checkpoint.get("result_record")
-    if checkpoint.get("stage") == "complete" and isinstance(completed_result, dict):
+    if (
+        checkpoint.get("stage") == "complete"
+        and checkpoint.get("materialization_mode") == SLOT_ALIGNED_MATERIALIZATION_MODE
+        and isinstance(completed_result, dict)
+    ):
         return build_group_job_result(completed_result)
 
     train_questions, val_questions = split_train_val(questions)
@@ -797,19 +712,19 @@ def optimize_group_job(
                     )
                     checkpoint["stage"] = "best_prompt_complete"
                     checkpoint["best_prompt"] = best_prompt
-                    checkpoint["best_prompt_version"] = prompt_version(best_prompt)
                     checkpoint["gepa_report"] = gepa_report
                     checkpoint["last_error"] = None
                     write_group_checkpoint(checkpoint_path, checkpoint)
 
-                baseline_metrics = checkpoint.get("baseline_metrics")
                 baseline_evaluations = checkpoint.get("baseline_evaluations")
+                materialization_mode = checkpoint.get("materialization_mode")
                 if (
-                    not isinstance(baseline_metrics, dict)
-                    or not isinstance(baseline_evaluations, list)
+                    materialization_mode != SLOT_ALIGNED_MATERIALIZATION_MODE
+                    or
+                    not isinstance(baseline_evaluations, list)
                     or not has_full_evaluation_coverage(questions, baseline_evaluations)
                 ):
-                    baseline_metrics, baseline_evaluations = event_loop_runner.run(
+                    _, baseline_evaluations = event_loop_runner.run(
                         evaluate_prompt_on_group_async(
                             prompt_text=WORLD_GEPA_USER_SEED_PROMPT,
                             questions=questions,
@@ -818,16 +733,20 @@ def optimize_group_job(
                             repeats=materialization_samples,
                             model_attempts=model_attempts,
                             shuffle_namespace=materialize_shuffle_namespace,
+                            slot_aligned=True,
                         )
                     )
                     checkpoint["stage"] = "baseline_complete"
-                    checkpoint["baseline_metrics"] = baseline_metrics
+                    checkpoint["materialization_mode"] = SLOT_ALIGNED_MATERIALIZATION_MODE
                     checkpoint["baseline_evaluations"] = baseline_evaluations
                     checkpoint["last_error"] = None
                     write_group_checkpoint(checkpoint_path, checkpoint)
 
                 existing_optimized_evaluations = checkpoint.get("optimized_evaluations")
-                if not isinstance(existing_optimized_evaluations, list):
+                if (
+                    checkpoint.get("materialization_mode") != SLOT_ALIGNED_MATERIALIZATION_MODE
+                    or not isinstance(existing_optimized_evaluations, list)
+                ):
                     existing_optimized_evaluations = []
                 optimized_by_id = {
                     evaluation_question_id(payload): payload
@@ -844,16 +763,16 @@ def optimize_group_job(
                         optimized_evaluations=ordered_evaluations,
                     )
                     checkpoint["stage"] = "optimized_partial"
+                    checkpoint["materialization_mode"] = SLOT_ALIGNED_MATERIALIZATION_MODE
                     checkpoint["optimized_evaluations"] = ordered_evaluations
                     checkpoint["optimized_progress"] = {
                         "completed": len(ordered_evaluations),
                         "total": len(questions),
                     }
-                    checkpoint["question_deltas"] = question_deltas
                     checkpoint["last_error"] = None
                     write_group_checkpoint(checkpoint_path, checkpoint)
 
-                optimized_metrics, optimized_evaluations = event_loop_runner.run(
+                _, optimized_evaluations = event_loop_runner.run(
                     evaluate_prompt_on_group_async(
                         prompt_text=best_prompt,
                         questions=questions,
@@ -862,6 +781,7 @@ def optimize_group_job(
                         repeats=materialization_samples,
                         model_attempts=model_attempts,
                         shuffle_namespace=materialize_shuffle_namespace,
+                        slot_aligned=True,
                         completed_evaluations=existing_optimized_evaluations,
                         per_question_callback=persist_optimized_question,
                     )
@@ -873,22 +793,18 @@ def optimize_group_job(
             group_id=group_id,
             target_model_name=target_model_name,
             domain=domain,
+            run_dir=run_dir_path,
             questions=questions,
-            best_prompt=best_prompt,
-            baseline_metrics=baseline_metrics,
-            optimized_metrics=optimized_metrics,
             baseline_evaluations=baseline_evaluations,
             optimized_evaluations=optimized_evaluations,
-            gepa_report=gepa_report,
         )
         checkpoint["stage"] = "complete"
-        checkpoint["optimized_metrics"] = optimized_metrics
+        checkpoint["materialization_mode"] = SLOT_ALIGNED_MATERIALIZATION_MODE
         checkpoint["optimized_evaluations"] = optimized_evaluations
         checkpoint["optimized_progress"] = {
             "completed": len(optimized_evaluations),
             "total": len(questions),
         }
-        checkpoint["question_deltas"] = result_record["question_deltas"]
         checkpoint["result_record"] = result_record
         checkpoint["last_error"] = None
         write_group_checkpoint(checkpoint_path, checkpoint)
@@ -921,7 +837,11 @@ def main() -> None:
         raise ValueError("--model-attempts must be positive")
 
     load_pipeline_model_config(args.config_path)
-    groups = load_needs_groups(args.decision_path)
+    question_payloads_by_id = {
+        question_id: question.to_dict()
+        for question_id, question in load_benchmark_question_map(args.question_path).items()
+    }
+    groups = load_needs_groups(args.decision_path, question_payloads_by_id)
     if not groups:
         raise ValueError(f"No GEPA groups found in {args.decision_path}")
 

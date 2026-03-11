@@ -325,14 +325,8 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
         correct = _open_qa_correct(parsed, question)
         exact_answer_text_match = normalize_answer_text(parsed.final_answer) == normalize_answer_text(question.gold_answer)
 
-    usable_for_distill = parsed.valid_json and correct and reasoning_present and think_tags_present
-    total = (
-        0.25 * float(parsed.valid_json)
-        + 0.15 * float(answer_present)
-        + 0.10 * float(reasoning_present)
-        + 0.15 * float(think_tags_present)
-        + 0.35 * float(correct)
-    )
+    usable_for_distill = correct
+    total = float(correct)
 
     return WorldScoreResult(
         total=round(total, 6),
@@ -350,3 +344,31 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
         gold_answer_index=question.gold_answer_index,
         gold_aliases=question.gold_aliases,
     )
+
+
+def score_with_optional_repair(
+    raw_response: str,
+    question: BenchmarkQuestion,
+) -> tuple[str, WorldScoreResult, dict[str, Any]]:
+    raw_score = score_world_response(raw_response, question)
+    if raw_score.correct and raw_score.valid_json and raw_score.think_tags_present:
+        return raw_response, raw_score, {"status": "not_needed"}
+
+    repaired_response, repair_meta = repair_world_response(raw_response, question)
+    if repaired_response is None:
+        return raw_response, raw_score, repair_meta
+
+    repaired_score = score_world_response(repaired_response, question)
+    use_repaired = False
+    if repaired_score.correct != raw_score.correct:
+        use_repaired = repaired_score.correct
+    elif repaired_score.total > raw_score.total:
+        use_repaired = True
+    elif raw_score.valid_json is False and repaired_score.valid_json is True:
+        use_repaired = True
+    elif raw_score.think_tags_present is False and repaired_score.think_tags_present is True:
+        use_repaired = True
+
+    if use_repaired:
+        return repaired_response, repaired_score, repair_meta
+    return raw_response, raw_score, repair_meta

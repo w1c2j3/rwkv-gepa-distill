@@ -34,10 +34,12 @@ class DatasetPaths:
     decision_path: Path
     gepa_results_path: Path
     gepa_run_dir: Path
+    complex_distill_path: Path
     rewrite_output_path: Path
     merged_sft_path: Path
     rwkv_output_path: Path
     summary_path: Path
+    question_flow_html_path: Path
 
 
 def default_python() -> str:
@@ -74,10 +76,12 @@ def dataset_paths(dataset_version: str) -> DatasetPaths:
         decision_path=dataset_dir / "question_decisions.jsonl",
         gepa_results_path=dataset_dir / "gepa_results.jsonl",
         gepa_run_dir=cache_dir / "gepa_run",
+        complex_distill_path=dataset_dir / "complex_distill.jsonl",
         rewrite_output_path=dataset_dir / "rewrite_distill.jsonl",
         merged_sft_path=dataset_dir / "distill_sft.jsonl",
         rwkv_output_path=dataset_dir / "distill_rwkv.jsonl",
         summary_path=dataset_dir / "pipeline_summary.json",
+        question_flow_html_path=dataset_dir / "question_flow.html",
     )
 
 
@@ -155,11 +159,15 @@ def add_rewrite_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cache-path", type=Path, default=None)
     parser.add_argument("--clear-cache", action="store_true")
     parser.add_argument("--rewrites-per-example", type=int, default=3)
-    parser.add_argument("--validation-samples", type=int, default=4)
+    parser.add_argument("--validation-samples", type=int, default=1)
     parser.add_argument("--model-attempts", type=int, default=2)
     parser.add_argument("--max-concurrency", type=int, default=8)
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
+
+
+def add_materialize_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
 
 
 def add_merge_args(parser: argparse.ArgumentParser) -> None:
@@ -169,6 +177,12 @@ def add_merge_args(parser: argparse.ArgumentParser) -> None:
 def add_export_rwkv_args(parser: argparse.ArgumentParser) -> None:
     add_dataset_version_arg(parser)
     parser.add_argument("--progress-interval", type=int, default=5000)
+
+
+def add_render_question_flow_args(parser: argparse.ArgumentParser) -> None:
+    add_dataset_version_arg(parser)
+    parser.add_argument("--question-id", type=str, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
 
 
 def add_full_args(parser: argparse.ArgumentParser) -> None:
@@ -186,7 +200,7 @@ def add_full_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--metric-samples", type=int, default=2)
     parser.add_argument("--materialization-samples", type=int, default=8)
     parser.add_argument("--rewrites-per-example", type=int, default=3)
-    parser.add_argument("--validation-samples", type=int, default=4)
+    parser.add_argument("--validation-samples", type=int, default=1)
     parser.add_argument("--resume", action="store_true", default=True)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.add_argument("--fresh-run-dir", action="store_true")
@@ -231,6 +245,8 @@ def benchmark_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         str(paths.question_path),
         "--output-path",
         str(paths.benchmark_cache_path),
+        "--summary-path",
+        str(paths.summary_path),
         "--cache-path",
         str(resolve_cache_path(args, paths)),
         "--samples-per-model",
@@ -275,6 +291,8 @@ def gepa_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "distill_gepa.optimize_world_prompts",
         "--config-path",
         str(args.config_path),
+        "--question-path",
+        str(paths.question_path),
         "--decision-path",
         str(paths.decision_path),
         "--output-path",
@@ -315,8 +333,10 @@ def rewrite_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "distill_gepa.rewrite_world_questions",
         "--config-path",
         str(args.config_path),
+        "--question-path",
+        str(paths.question_path),
         "--input-path",
-        str(paths.gepa_results_path),
+        str(paths.complex_distill_path),
         "--output-path",
         str(paths.rewrite_output_path),
         "--cache-path",
@@ -336,6 +356,24 @@ def rewrite_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     return command
 
 
+def materialize_complex_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    return [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.materialize_complex_distill",
+        "--question-path",
+        str(paths.question_path),
+        "--benchmark-path",
+        str(paths.benchmark_cache_path),
+        "--gepa-path",
+        str(paths.gepa_results_path),
+        "--output-path",
+        str(paths.complex_distill_path),
+    ]
+
+
 def merge_command(args: argparse.Namespace, python_bin: str) -> list[str]:
     paths = dataset_paths(args.dataset_version)
     return [
@@ -345,8 +383,12 @@ def merge_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "distill_gepa.merge_world_distill",
         "--decision-path",
         str(paths.decision_path),
+        "--benchmark-path",
+        str(paths.benchmark_cache_path),
         "--gepa-path",
         str(paths.gepa_results_path),
+        "--complex-path",
+        str(paths.complex_distill_path),
         "--rewrite-path",
         str(paths.rewrite_output_path),
         "--output-path",
@@ -372,6 +414,24 @@ def export_rwkv_command(args: argparse.Namespace, python_bin: str) -> list[str]:
         "--progress-interval",
         str(args.progress_interval),
     ]
+
+
+def render_question_flow_command(args: argparse.Namespace, python_bin: str) -> list[str]:
+    paths = dataset_paths(args.dataset_version)
+    output_path = args.output_path if args.output_path is not None else paths.question_flow_html_path
+    command = [
+        python_bin,
+        "-u",
+        "-m",
+        "distill_gepa.render_question_flow_html",
+        "--dataset-dir",
+        str(paths.dataset_dir),
+        "--output-path",
+        str(output_path),
+    ]
+    if args.question_id is not None:
+        command.extend(["--question-id", args.question_id])
+    return command
 
 
 def full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
@@ -419,6 +479,7 @@ def full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
         max_concurrency=args.max_concurrency,
         resume=args.resume,
     )
+    materialize_args = argparse.Namespace(dataset_version=args.dataset_version)
     merge_args = argparse.Namespace(dataset_version=args.dataset_version)
     export_args = argparse.Namespace(dataset_version=args.dataset_version, progress_interval=args.rwkv_progress_interval)
     return [
@@ -426,8 +487,9 @@ def full_tasks(args: argparse.Namespace, python_bin: str) -> list[TaskSpec]:
         TaskSpec("run-benchmark", "Run four-model benchmark evaluation.", benchmark_command(benchmark_args, python_bin)),
         TaskSpec("classify-questions", "Aggregate benchmark samples into per-question decisions.", classify_command(classify_args, python_bin)),
         TaskSpec("optimize-gepa", "Optimize per-model same-domain prompts with GEPA and store grouped results.", gepa_command(gepa_args, python_bin)),
-        TaskSpec("rewrite-questions", "Rewrite complex GEPA questions into simpler distillation prompts.", rewrite_command(rewrite_args, python_bin)),
-        TaskSpec("merge-distill", "Merge direct and GEPA-derived distillation datasets.", merge_command(merge_args, python_bin)),
+        TaskSpec("materialize-complex", "Materialize slot-aligned complex distillation rows.", materialize_complex_command(materialize_args, python_bin)),
+        TaskSpec("rewrite-questions", "Rewrite complex trajectories into simpler prompts.", rewrite_command(rewrite_args, python_bin)),
+        TaskSpec("merge-distill", "Merge complex and rewrite distillation datasets.", merge_command(merge_args, python_bin)),
         TaskSpec("export-rwkv", "Export the merged SFT dataset into RWKV format.", export_rwkv_command(export_args, python_bin)),
     ]
 
@@ -451,11 +513,17 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite_parser = subparsers.add_parser("rewrite-questions", help="Rewrite GEPA complex questions.")
     add_rewrite_args(rewrite_parser)
 
+    materialize_parser = subparsers.add_parser("materialize-complex", help="Materialize slot-aligned complex rows.")
+    add_materialize_args(materialize_parser)
+
     merge_parser = subparsers.add_parser("merge-distill", help="Merge all distillation datasets.")
     add_merge_args(merge_parser)
 
     export_parser = subparsers.add_parser("export-rwkv", help="Export merged SFT dataset as RWKV text jsonl.")
     add_export_rwkv_args(export_parser)
+
+    render_parser = subparsers.add_parser("render-question-flow", help="Render one-question HTML flow report.")
+    add_render_question_flow_args(render_parser)
 
     full_parser = subparsers.add_parser("full-world", help="Run the full world-knowledge distillation pipeline.")
     add_full_args(full_parser)
@@ -481,12 +549,16 @@ def main(argv: list[str] | None = None) -> None:
         tasks = [TaskSpec("classify-questions", "Classify world benchmark questions.", classify_command(args, python_bin))]
     elif args.command == "optimize-gepa":
         tasks = [TaskSpec("optimize-gepa", "Run grouped GEPA prompt optimization.", gepa_command(args, python_bin))]
+    elif args.command == "materialize-complex":
+        tasks = [TaskSpec("materialize-complex", "Materialize slot-aligned complex rows.", materialize_complex_command(args, python_bin))]
     elif args.command == "rewrite-questions":
-        tasks = [TaskSpec("rewrite-questions", "Rewrite complex GEPA prompts into simple prompts.", rewrite_command(args, python_bin))]
+        tasks = [TaskSpec("rewrite-questions", "Rewrite complex trajectories into simple prompts.", rewrite_command(args, python_bin))]
     elif args.command == "merge-distill":
-        tasks = [TaskSpec("merge-distill", "Merge direct and GEPA-derived distillation datasets.", merge_command(args, python_bin))]
+        tasks = [TaskSpec("merge-distill", "Merge complex and rewrite distillation datasets.", merge_command(args, python_bin))]
     elif args.command == "export-rwkv":
         tasks = [TaskSpec("export-rwkv", "Export merged SFT as RWKV text.", export_rwkv_command(args, python_bin))]
+    elif args.command == "render-question-flow":
+        tasks = [TaskSpec("render-question-flow", "Render one-question HTML flow report.", render_question_flow_command(args, python_bin))]
     elif args.command == "full-world":
         tasks = full_tasks(args, python_bin)
     else:
