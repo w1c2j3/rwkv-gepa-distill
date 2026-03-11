@@ -35,12 +35,22 @@ class RequestCache:
         self.path = path
         self._init_lock = threading.Lock()
         self._initialized = False
+        self._local = threading.local()
         self._ensure_initialized()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _create_connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA busy_timeout=30000")
+        return connection
+
+    def _connection(self) -> sqlite3.Connection:
+        self._ensure_initialized()
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = self._create_connection()
+            self._local.connection = connection
         return connection
 
     def _ensure_initialized(self) -> None:
@@ -50,7 +60,7 @@ class RequestCache:
             if self._initialized:
                 return
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connect() as connection:
+            with self._create_connection() as connection:
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS request_cache (
@@ -63,32 +73,33 @@ class RequestCache:
             self._initialized = True
 
     def get(self, cache_key: str) -> str | None:
-        self._ensure_initialized()
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT response_text FROM request_cache WHERE cache_key = ?",
-                (cache_key,),
-            ).fetchone()
+        row = self._connection().execute(
+            "SELECT response_text FROM request_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
         if row is None:
             return None
         value = row[0]
         return value if isinstance(value, str) else None
 
     def set(self, cache_key: str, response_text: str) -> None:
-        self._ensure_initialized()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO request_cache(cache_key, response_text, created_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    response_text = excluded.response_text,
-                    created_at = excluded.created_at
-                """,
-                (cache_key, response_text, time.time()),
-            )
+        self._connection().execute(
+            """
+            INSERT INTO request_cache(cache_key, response_text, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                response_text = excluded.response_text,
+                created_at = excluded.created_at
+            """,
+            (cache_key, response_text, time.time()),
+        )
 
     def delete(self, cache_key: str) -> None:
-        self._ensure_initialized()
-        with self._connect() as connection:
-            connection.execute("DELETE FROM request_cache WHERE cache_key = ?", (cache_key,))
+        self._connection().execute("DELETE FROM request_cache WHERE cache_key = ?", (cache_key,))
+
+    def close(self) -> None:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            return
+        connection.close()
+        self._local.connection = None

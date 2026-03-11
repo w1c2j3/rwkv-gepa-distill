@@ -40,12 +40,18 @@ def build_rwkv_row(payload: dict[str, Any]) -> dict[str, str]:
     if not isinstance(assistant_response, str) or not assistant_response.strip():
         raise ValueError("Missing non-empty 'assistant'")
 
-    text = (
+    prompt = (
         f"System: {system_prompt.strip()}\n\n"
         f"User: {user_prompt.strip()}\n\n"
-        f"Assistant: {assistant_response.strip()}"
+        "Assistant:"
     )
-    return {"text": text}
+    response = assistant_response.strip()
+    text = f"{prompt} {response}"
+    return {
+        "prompt": prompt,
+        "response": response,
+        "text": text,
+    }
 
 
 def main() -> None:

@@ -12,6 +12,7 @@ from .model_registry import load_pipeline_model_config
 
 
 QUESTION_DECISION_CONTRACT = "question_decision_v1"
+MIN_GEPA_CORRECT_RATE = 0.25
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +58,10 @@ def build_model_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
     correct = sum(1 for item in samples if item["score"].get("correct") is True)
     valid_json = sum(1 for item in samples if item["score"].get("valid_json") is True)
     think_tags = sum(1 for item in samples if item["score"].get("think_tags_present") is True)
+    correct_rate = round(correct / total, 6) if total else 0.0
+    correct_and_valid_rate = round(correct_and_valid / total, 6) if total else 0.0
+    valid_json_rate = round(valid_json / total, 6) if total else 0.0
+    think_tag_rate = round(think_tags / total, 6) if total else 0.0
     answer_signatures = Counter(_normalize_answer_signature(item) for item in samples)
     answer_signatures.pop("__missing__", None)
     majority_answer_signature = None
@@ -104,10 +109,10 @@ def build_model_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "correct_and_valid_count": correct_and_valid,
         "valid_json_count": valid_json,
         "think_tag_count": think_tags,
-        "correct_rate": round(correct / total, 6) if total else 0.0,
-        "correct_and_valid_rate": round(correct_and_valid / total, 6) if total else 0.0,
-        "valid_json_rate": round(valid_json / total, 6) if total else 0.0,
-        "think_tag_rate": round(think_tags / total, 6) if total else 0.0,
+        "correct_rate": correct_rate,
+        "correct_and_valid_rate": correct_and_valid_rate,
+        "valid_json_rate": valid_json_rate,
+        "think_tag_rate": think_tag_rate,
         "distinct_answer_count": len(answer_signatures),
         "majority_answer_signature": majority_answer_signature,
         "majority_answer_count": majority_answer_count,
@@ -119,7 +124,8 @@ def build_model_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "strict_stable_correct": strict_stable_correct,
         "stable_wrong": stable_wrong,
         "usable_for_direct_distill": strict_stable_correct,
-        "usable_for_gepa": correct > 0 and not stable_correct,
+        "usable_for_gepa": correct_rate >= MIN_GEPA_CORRECT_RATE and not stable_correct,
+        "usable_for_gepa_threshold": MIN_GEPA_CORRECT_RATE,
         "preferred_response_text": preferred_sample["response_text"] if preferred_sample else None,
         "preferred_instruction": preferred_sample["instruction"] if preferred_sample else None,
         "preferred_prompt": preferred_sample["system_prompt"] if preferred_sample else None,

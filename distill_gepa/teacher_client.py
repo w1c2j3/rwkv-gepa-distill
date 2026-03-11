@@ -9,8 +9,7 @@ from typing import Any, Sequence
 import orjson
 from dotenv import load_dotenv
 
-
-ANSWER_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+from .constants import ANSWER_LABELS
 
 
 def env_first(*names: str) -> str | None:

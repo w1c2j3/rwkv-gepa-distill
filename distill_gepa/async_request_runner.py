@@ -129,3 +129,5 @@ class AsyncRequestRunner:
             close_method = getattr(client, "aclose", None)
             if close_method is not None:
                 await close_method()
+        if self._cache is not None:
+            self._cache.close()

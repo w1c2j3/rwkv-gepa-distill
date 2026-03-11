@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import string
 from collections import Counter
 from typing import Any, Iterable
 
@@ -10,8 +9,7 @@ try:
 except ImportError:  # pragma: no cover
     tqdm = None
 
-
-ANSWER_LABELS = list(string.ascii_uppercase)
+from .constants import ANSWER_LABELS
 SUBJECT_INFERENCE_STOPWORDS = {
     "a",
     "an",
@@ -90,7 +88,7 @@ def infer_answer_index(raw_answer: Any, choices: list[str]) -> int | None:
     if raw_answer is None:
         return None
     if isinstance(raw_answer, bool):
-        return int(raw_answer)
+        return None
     if isinstance(raw_answer, int):
         return raw_answer
     if isinstance(raw_answer, float) and raw_answer.is_integer():

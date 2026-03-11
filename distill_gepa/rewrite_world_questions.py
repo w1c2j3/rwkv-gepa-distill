@@ -326,11 +326,12 @@ async def async_main(args: argparse.Namespace) -> None:
 
     if not args.resume and args.output_path.exists():
         args.output_path.unlink()
-    if args.failure_path.exists():
+    if not args.resume and args.failure_path.exists():
         args.failure_path.unlink()
 
     processed_question_ids = load_processed_question_ids(args.output_path) if args.resume else set()
     output_mode = "ab" if args.resume and args.output_path.exists() and args.output_path.stat().st_size > 0 else "wb"
+    failure_mode = "ab" if args.resume and args.failure_path.exists() and args.failure_path.stat().st_size > 0 else "wb"
 
     pending = list(iter_improved_examples(args.input_path, processed_question_ids))
 
@@ -364,7 +365,7 @@ async def async_main(args: argparse.Namespace) -> None:
         return True
 
     try:
-        with args.output_path.open(output_mode) as output_handle, args.failure_path.open("wb") as failure_handle:
+        with args.output_path.open(output_mode) as output_handle, args.failure_path.open(failure_mode) as failure_handle:
             while len(in_flight) < min(args.max_concurrency, len(pending)):
                 if not await schedule_next():
                     break

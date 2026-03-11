@@ -6,7 +6,8 @@ from typing import Any
 
 import orjson
 
-from .world_schema import ANSWER_LABELS, BenchmarkQuestion, QUESTION_TYPE_MULTIPLE_CHOICE
+from .constants import ANSWER_LABELS
+from .world_schema import BenchmarkQuestion, QUESTION_TYPE_MULTIPLE_CHOICE
 
 
 def normalize_answer_text(value: str) -> str:
@@ -33,9 +34,27 @@ def extract_json_object(raw_text: str) -> dict[str, Any] | None:
     start = raw_text.find("{")
     if start == -1:
         return None
+
     depth = 0
+    in_string = False
+    escape_next = False
     for index in range(start, len(raw_text)):
         char = raw_text[index]
+
+        if in_string:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
         if char == "{":
             depth += 1
         elif char == "}":
@@ -66,7 +85,7 @@ def infer_answer_index(value: Any, choices: list[str]) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool):
-        return int(value)
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, float) and value.is_integer():
@@ -269,13 +288,19 @@ def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tup
 
 def _mcq_correct(parsed: ParsedWorldResponse, question: BenchmarkQuestion) -> tuple[bool, bool]:
     gold_index = question.gold_answer_index
-    if gold_index is None:
-        return False, False
     exact_text_match = parsed.answer_text == question.gold_answer if bool(parsed.answer_text) else False
-    if parsed.answer_index is not None:
+
+    if gold_index is not None and parsed.answer_index is not None:
         return parsed.answer_index == gold_index, exact_text_match
-    if parsed.final_answer:
-        return normalize_answer_text(parsed.final_answer) == normalize_answer_text(question.gold_answer), exact_text_match
+
+    accepted = {normalize_answer_text(question.gold_answer)}
+    accepted.update(normalize_answer_text(alias) for alias in question.gold_aliases if alias.strip())
+
+    for candidate in (parsed.answer_text, parsed.final_answer):
+        normalized = normalize_answer_text(candidate)
+        if normalized:
+            return normalized in accepted, exact_text_match
+
     return False, exact_text_match
 
 

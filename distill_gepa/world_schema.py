@@ -7,11 +7,12 @@ from typing import Any, Iterable
 
 import orjson
 
+from .constants import ANSWER_LABELS
+
 
 WORLD_QUESTION_CONTRACT = "world_question_v1"
 QUESTION_TYPE_MULTIPLE_CHOICE = "multiple_choice"
 QUESTION_TYPE_OPEN_QA = "open_qa"
-ANSWER_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def _clean_text(value: Any) -> str:
