@@ -126,8 +126,8 @@ class ModelEndpointConfig:
 @dataclass(frozen=True)
 class PipelineModelConfig:
     base_models: tuple[ModelEndpointConfig, ...]
-    gepa_reflection_model: ModelEndpointConfig
-    rewrite_model: ModelEndpointConfig
+    variant_generator_model: ModelEndpointConfig
+    prompt_optimizer_model: ModelEndpointConfig
 
     def base_model(self, name: str) -> ModelEndpointConfig:
         for item in self.base_models:
@@ -163,16 +163,16 @@ def load_pipeline_model_config(path: Path) -> PipelineModelConfig:
     if len(parsed_base_models) != len(base_models):
         raise ValueError(f"{path}: every item in 'base_models' must be an object")
 
-    gepa_payload = payload.get("gepa_reflection_model")
-    if not isinstance(gepa_payload, dict):
-        raise ValueError(f"{path}: 'gepa_reflection_model' must be an object")
+    generator_payload = payload.get("variant_generator_model")
+    if not isinstance(generator_payload, dict):
+        raise ValueError(f"{path}: 'variant_generator_model' must be an object")
 
-    rewrite_payload = payload.get("rewrite_model")
-    if not isinstance(rewrite_payload, dict):
-        raise ValueError(f"{path}: 'rewrite_model' must be an object")
+    optimizer_payload = payload.get("prompt_optimizer_model")
+    if not isinstance(optimizer_payload, dict):
+        raise ValueError(f"{path}: 'prompt_optimizer_model' must be an object")
 
     return PipelineModelConfig(
         base_models=parsed_base_models,
-        gepa_reflection_model=ModelEndpointConfig.from_dict(gepa_payload, defaults=defaults),
-        rewrite_model=ModelEndpointConfig.from_dict(rewrite_payload, defaults=defaults),
+        variant_generator_model=ModelEndpointConfig.from_dict(generator_payload, defaults=defaults),
+        prompt_optimizer_model=ModelEndpointConfig.from_dict(optimizer_payload, defaults=defaults),
     )

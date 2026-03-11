@@ -1,37 +1,30 @@
 defaults:
   api_protocol: chat_completions
-  timeout_seconds: 60
-  num_retries: 2
-  max_tokens: 256
+  timeout_seconds: 120
+  num_retries: 3
+  max_tokens: 512
   prefer_stream: false
 
 base_models:
-  - name: base-model-1
-    model: example-model-1
-    base_url: http://127.0.0.1:8001/v1
-    api_key: local
-  - name: base-model-2
-    model: example-model-2
-    base_url: http://127.0.0.1:8002/v1
-    api_key: local
-  - name: base-model-3
-    model: example-model-3
-    base_url: http://127.0.0.1:8003/v1
-    api_key: local
-  - name: base-model-4
-    model: example-model-4
-    base_url: http://127.0.0.1:8004/v1
-    api_key: local
-    api_protocol: responses
+  - name: target-model-1
+    model: target-model-1
+    base_url: https://example.com/v1
+    api_key_env: EXAMPLE_API_KEY
+  - name: target-model-2
+    model: target-model-2
+    base_url: https://example.com/v1
+    api_key_env: EXAMPLE_API_KEY
 
-gepa_reflection_model:
-  name: reflection-model
-  model: example-reflection-model
-  base_url: http://127.0.0.1:8010/v1
-  api_key: local
+variant_generator_model:
+  name: generator-model
+  model: gpt-5.4
+  base_url: https://example.com/v1
+  api_key_env: EXAMPLE_API_KEY
+  api_protocol: responses
 
-rewrite_model:
-  name: rewrite-model
-  model: example-rewrite-model
-  base_url: http://127.0.0.1:8011/v1
-  api_key: local
+prompt_optimizer_model:
+  name: optimizer-model
+  model: gpt-5.4
+  base_url: https://example.com/v1
+  api_key_env: EXAMPLE_API_KEY
+  api_protocol: responses

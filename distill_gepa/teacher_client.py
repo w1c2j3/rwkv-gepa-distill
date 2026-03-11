@@ -550,7 +550,9 @@ class TeacherClient:
         prompt_lower = system_prompt.lower()
         wants_json = "json" in prompt_lower and "answer" in prompt_lower
         wants_mcq = "answer_letter" in prompt_lower or "multiple-choice" in prompt_lower or "multiple choice" in prompt_lower
-        wants_rewrite = "simple_questions" in prompt_lower
+        wants_variants = '"variants"' in prompt_lower or "generate high-quality training variants" in prompt_lower
+        wants_optimized_prompt = '"optimized_system_prompt"' in prompt_lower or "improve a system prompt" in prompt_lower
+        wants_direct_answer = "answer questions accurately and concisely" in prompt_lower
         open_qa_prompt = "question type: open_qa" in user_message.lower()
         model_name = (self.config.model or "").lower()
 
@@ -570,15 +572,55 @@ class TeacherClient:
         selected_text = option_matches[selected_index] if selected_index < len(option_matches) else "Mock answer"
         open_answer = "Wrong answer" if "wrong" in model_name else "Mock answer"
 
-        if wants_rewrite:
+        if wants_variants:
+            if open_qa_prompt:
+                content = orjson.dumps(
+                    {
+                        "variants": [
+                            {
+                                "question": "Mock variant question one?",
+                                "answer": "Mock answer",
+                                "answer_aliases": [],
+                            },
+                            {
+                                "question": "Mock variant question two?",
+                                "answer": "Mock answer",
+                                "answer_aliases": [],
+                            },
+                        ]
+                    }
+                ).decode("utf-8")
+            else:
+                content = orjson.dumps(
+                    {
+                        "variants": [
+                            {
+                                "question": "Mock multiple choice variant one?",
+                                "choices": ["Mock answer", "Wrong answer", "Distractor 1", "Distractor 2"],
+                                "answer": "Mock answer",
+                                "answer_index": 0,
+                                "answer_aliases": [],
+                            },
+                            {
+                                "question": "Mock multiple choice variant two?",
+                                "choices": ["Mock answer", "Wrong answer", "Distractor 1", "Distractor 2"],
+                                "answer": "Mock answer",
+                                "answer_index": 0,
+                                "answer_aliases": [],
+                            },
+                        ]
+                    }
+                ).decode("utf-8")
+        elif wants_optimized_prompt:
             content = orjson.dumps(
                 {
-                    "simple_questions": [
-                        "Simplified mock question one?",
-                        "Simplified mock question two?",
-                    ]
+                    "optimized_system_prompt": "Answer accurately. For multiple choice, return the correct option text. For open QA, return a short exact answer."
                 }
             ).decode("utf-8")
+        elif wants_direct_answer and open_qa_prompt:
+            content = open_answer
+        elif wants_direct_answer:
+            content = selected_text
         elif wants_json and open_qa_prompt:
             content = orjson.dumps(
                 {

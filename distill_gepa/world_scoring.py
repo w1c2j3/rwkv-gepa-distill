@@ -21,15 +21,6 @@ def has_think_tags(value: str) -> bool:
     return bool(THINK_TAG_PATTERN.search(value))
 
 
-def ensure_think_tags(value: str) -> str:
-    stripped = value.strip()
-    if not stripped:
-        return "<think></think>"
-    if has_think_tags(stripped):
-        return stripped
-    return f"<think>{stripped}</think>"
-
-
 def extract_json_object(raw_text: str) -> dict[str, Any] | None:
     start = raw_text.find("{")
     if start == -1:
@@ -236,21 +227,8 @@ def _extract_short_open_answer(text: str) -> str:
 
 def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tuple[str | None, dict[str, Any]]:
     parsed = parse_world_response(raw_response, question)
-    if parsed.valid_json and has_think_tags(parsed.reasoning):
-        return raw_response, {"status": "not_needed"}
     if parsed.valid_json:
-        try:
-            payload = orjson.loads(raw_response)
-        except orjson.JSONDecodeError:
-            payload = extract_json_object(raw_response)
-        if not isinstance(payload, dict):
-            return None, {"status": "failed", "reason": "valid_json_payload_not_extractable"}
-        reasoning_text = _truncate_reasoning(parsed.reasoning)
-        payload["reasoning"] = ensure_think_tags(reasoning_text or "Brief reasoning unavailable.")
-        return orjson.dumps(payload).decode("utf-8"), {
-            "status": "repaired",
-            "strategy": "reasoning_think_tag_wrap",
-        }
+        return raw_response, {"status": "not_needed"}
 
     if question.question_type == QUESTION_TYPE_MULTIPLE_CHOICE:
         answer_index = parsed.answer_index
@@ -266,7 +244,7 @@ def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tup
             "answer_letter": ANSWER_LABELS[answer_index],
             "answer_index": answer_index,
             "answer_text": question.choices[answer_index],
-            "reasoning": ensure_think_tags(_truncate_reasoning(parsed.reasoning or raw_response)),
+            "reasoning": _truncate_reasoning(parsed.reasoning or raw_response),
         }
         return orjson.dumps(repaired_payload).decode("utf-8"), {
             "status": "repaired",
@@ -278,7 +256,7 @@ def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tup
         return None, {"status": "failed", "reason": "unable_to_extract_short_answer"}
     repaired_payload = {
         "final_answer": short_answer,
-        "reasoning": ensure_think_tags(_truncate_reasoning(parsed.reasoning or raw_response)),
+        "reasoning": _truncate_reasoning(parsed.reasoning or raw_response),
     }
     return orjson.dumps(repaired_payload).decode("utf-8"), {
         "status": "repaired",
@@ -351,7 +329,7 @@ def score_with_optional_repair(
     question: BenchmarkQuestion,
 ) -> tuple[str, WorldScoreResult, dict[str, Any]]:
     raw_score = score_world_response(raw_response, question)
-    if raw_score.correct and raw_score.valid_json and raw_score.think_tags_present:
+    if raw_score.correct and raw_score.valid_json:
         return raw_response, raw_score, {"status": "not_needed"}
 
     repaired_response, repair_meta = repair_world_response(raw_response, question)
@@ -365,8 +343,6 @@ def score_with_optional_repair(
     elif repaired_score.total > raw_score.total:
         use_repaired = True
     elif raw_score.valid_json is False and repaired_score.valid_json is True:
-        use_repaired = True
-    elif raw_score.think_tags_present is False and repaired_score.think_tags_present is True:
         use_repaired = True
 
     if use_repaired:

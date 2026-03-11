@@ -1,88 +1,182 @@
-# RWKV GEPA Distill
+# Seed-Driven Distillation
 
-World-knowledge synthetic data pipeline for:
+This repo runs one pipeline:
 
-- preparing a unified benchmark pool from dataset TOML files in `config/datasets/`
-- running four base models through an OpenAI-compatible API with repeated shuffled-choice evaluation
-- classifying questions into `direct_distill`, `needs_optimization`, and `suspected_anomaly`
-- optimizing grouped user-side prompts with GEPA for `target_model x domain`
-- rewriting successful complex questions into simpler distillation prompts
-- exporting merged SFT and RWKV datasets
+1. read seed questions from a local file
+2. auto-download and prepare the dataset if the local seed file is missing
+3. use `gpt-5.4` to generate related variants
+4. let 4 target models answer every generated variant
+5. retry failed answers with model-specific optimized prompts
+6. keep correct rows as distillation data
+7. keep fully unresolved rows in a separate failure file
 
-All model calls use an OpenAI-compatible API surface. To switch from a remote endpoint to a local model server,
-change the configured `base_url` to `http://127.0.0.1:<port>/v1`.
+## Quick Start
 
-## Config
+### 1. Install dependencies
 
-Edit [config/world_pipeline.yaml](/home/chase/GitHub/rwkv-gepa-distill/config/world_pipeline.yaml).
+```bash
+bash scripts/bootstrap.sh
+```
 
-Model roles are separated:
+### 2. Fill API key
 
-- `base_models`: the four benchmark models
-- `gepa_reflection_model`: the large model used by GEPA
-- `rewrite_model`: the large model used to rewrite complex questions
+Copy `.env.example` to `.env` and fill the key:
 
-Each entry uses the same OpenAI-compatible fields:
+```bash
+cp .env.example .env
+```
 
-- `name`
-- `model`
-- `base_url`
-- `api_key`
-- `api_protocol`
+Required field in `.env`:
 
-`config/world_pipeline.example.yaml` is the template copy.
+```bash
+REELXAI_API_KEY=your_api_key_here
+```
 
-## Pipeline
+If you want to change provider, base URL, or model names, edit:
 
-The default entrypoint is:
+```bash
+config/world_pipeline.yaml
+```
+
+Current default config already uses:
+
+- base URL: `https://reelxai.com/v1`
+- generator model: `gpt-5.4`
+- prompt optimizer model: `gpt-5.4`
+- answer models:
+  - `gemini-3-flash-preview`
+  - `gpt-5-2025-08-07`
+  - `claude-sonnet-4-5-20250929`
+  - `grok-4.2`
+
+## One-Command Reproduction
+
+Run the README demo with a 100-question cap:
+
+```bash
+python scripts/scheduler.py --limit 100
+```
+
+This is the recommended command for other people cloning the repo.
+
+## Default Behavior
+
+`python scripts/scheduler.py` uses these defaults:
+
+- seed input path: `data/mmlu_auxiliary_train/questions.jsonl`
+- dataset name: `mmlu_auxiliary_train_seed_run`
+- variants per seed: `12`
+- limit: no limit
+
+If `data/mmlu_auxiliary_train/questions.jsonl` does not exist, the scheduler will automatically check:
+
+```bash
+config/datasets/mmlu_auxiliary_train.toml
+```
+
+and then auto-download/prepare the dataset from Hugging Face before running.
+
+So on a fresh clone, the following is enough:
+
+```bash
+python scripts/scheduler.py --limit 100
+```
+
+## Useful Commands
+
+Run all available seed questions:
 
 ```bash
 python scripts/scheduler.py
 ```
 
-With no arguments it runs `full-world`, which does:
-
-1. prepare the dataset declared in `config/datasets/<dataset>.toml`
-2. run four-model repeated evaluation
-3. classify questions
-4. run grouped GEPA user-prompt optimization
-5. rewrite complex GEPA questions into simpler prompts and revalidate them under shuffled choices
-6. merge all distillation sources
-7. export RWKV training jsonl
-
-Useful subcommands:
+Run a small test:
 
 ```bash
-python scripts/scheduler.py prepare-world --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py run-benchmark --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py classify-questions --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py optimize-gepa --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py rewrite-questions --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py merge-distill --dataset-name mmlu_auxiliary_train
-python scripts/scheduler.py export-rwkv --dataset-name mmlu_auxiliary_train
+python scripts/scheduler.py --limit 5
 ```
 
-## Default Outputs
+Run with a custom seed file:
 
-For `--dataset-name mmlu_auxiliary_train` the main outputs are:
+```bash
+python scripts/scheduler.py --seed-input-path /path/to/wrong_questions.jsonl --dataset-name my_run --variants-per-seed 24
+```
 
-- questions: `data/mmlu_auxiliary_train/questions.jsonl`
-- per-question decisions: `data/mmlu_auxiliary_train/question_decisions.jsonl`
-- GEPA grouped results: `data/mmlu_auxiliary_train/gepa_results.jsonl`
-- rewrite distill rows: `data/mmlu_auxiliary_train/rewrite_distill.jsonl`
-- merged SFT dataset: `data/mmlu_auxiliary_train/distill_sft.jsonl`
-- RWKV dataset: `data/mmlu_auxiliary_train/distill_rwkv.jsonl`
-- pipeline summary: `data/mmlu_auxiliary_train/pipeline_summary.json`
-- cache directory: `data/mmlu_auxiliary_train/cache/`
+## Final Outputs
 
-## Notes
+The pipeline writes these public outputs:
 
-- all multiple-choice model calls use shuffled options, not the source order
-- assistant responses must be strict JSON and keep reasoning inside `<think>...</think>`
-- `direct_distill`: all four base models are stably correct; export additionally requires `<think>`-tagged reasoning
-- `suspected_anomaly`: all four base models are stably wrong
-- `needs_optimization`: anything else enters grouped GEPA optimization
-- grouped GEPA works at `target_model x domain` granularity
-- grouped GEPA keeps the JSON system prompt fixed and searches a user-side prompt prefix
-- rewrite revalidates simple prompts with repeated shuffled-choice checks
-- root dataset folders keep only JSON/JSONL outputs; large intermediate state lives under `data/<dataset>/cache/`
+- `data/<dataset-name>/generated_questions.jsonl`
+- `data/<dataset-name>/distill_data.jsonl`
+- `data/<dataset-name>/unresolved_failures.jsonl`
+
+Internal files stay under:
+
+- `data/<dataset-name>/cache/`
+
+## Output Schemas
+
+`generated_questions.jsonl`: one row per original seed question, with all generated variants.
+
+Example:
+
+```json
+{
+  "seed_id": "mmlu_auxiliary_train::auxiliary_train::0",
+  "domain": "abstract algebra",
+  "question_type": "multiple_choice",
+  "question": "Which of these is an element?",
+  "answer": "O_{2}",
+  "answer_index": 1,
+  "choices": ["KBr", "O_{2}", "2KCl", "FeO_{2}"],
+  "generated_questions": [
+    {
+      "variant_id": "mmlu_auxiliary_train::auxiliary_train::0::variant::0",
+      "question": "Which of the following represents an element rather than a compound or mixture?",
+      "answer": "N_{2}",
+      "answer_index": 1,
+      "choices": ["NaCl", "N_{2}", "3MgO", "CaCO_{3}"],
+      "generator_model": "gpt-5.4",
+      "generation_prompt_version": "prompt-xxxx"
+    }
+  ]
+}
+```
+
+`distill_data.jsonl`: one row per kept correct answer.
+
+Example:
+
+```json
+{
+  "source_type": "direct_answer",
+  "seed_id": "mmlu_auxiliary_train::auxiliary_train::0",
+  "variant_id": "mmlu_auxiliary_train::auxiliary_train::0::variant::0",
+  "model_name": "gemini-3-flash-preview",
+  "question_type": "multiple_choice",
+  "question": "Which of the following represents an element rather than a compound or mixture?",
+  "gold_answer": "N_{2}",
+  "gold_answer_index": 1,
+  "model_answer": "N_{2}",
+  "model_answer_index": 1,
+  "choices": ["NaCl", "N_{2}", "3MgO", "CaCO_{3}"]
+}
+```
+
+For recovered rows, `source_type` is `optimized_answer`, and the row also includes:
+
+- `direct_model_answer`
+- `direct_model_answer_index`
+- `optimized_system_prompt`
+- `optimized_prompt_version`
+
+`unresolved_failures.jsonl`: one row per variant that all models still failed after prompt optimization.
+
+## Upload Notes
+
+Before pushing to GitHub:
+
+- do not commit `.env`
+- commit `.env.example`
+- commit `config/world_pipeline.yaml` only if you want to keep the default provider and model names public
+- large output folders under `data/` are usually better left out unless you intentionally want to publish artifacts
