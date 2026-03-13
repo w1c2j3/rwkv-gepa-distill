@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import orjson
 
-from .constants import ANSWER_LABELS
-from .world_schema import BenchmarkQuestion, QUESTION_TYPE_MULTIPLE_CHOICE
+from .constants import (
+    ANSWER_LABELS,
+    QUESTION_TYPE_MULTIPLE_CHOICE,
+)
+
+
+class ScoringTask(Protocol):
+    question_type: str
+    choices: list[str]
+    reference_answer: str
+    reference_answer_index: int | None
+    reference_aliases: list[str]
 
 
 def normalize_answer_text(value: str) -> str:
@@ -91,6 +101,32 @@ def infer_answer_index(value: Any, choices: list[str]) -> int | None:
     return None
 
 
+def _infer_mcq_choice_from_freeform(raw_response: str, choices: list[str]) -> tuple[str | None, int | None]:
+    stripped = raw_response.strip()
+    if not stripped:
+        return None, None
+
+    prefixed_match = re.match(
+        r"^(?:answer|final answer)\s*[:\-]\s*([A-J])(?:[\.\)\:\-]|\s|$)",
+        stripped,
+        re.IGNORECASE,
+    )
+    if prefixed_match:
+        answer_letter = prefixed_match.group(1).upper()
+        return answer_letter, infer_answer_index(answer_letter, choices)
+
+    leading_letter_match = re.match(r"^([A-J])(?:[\.\)\:\-]|\s|$)", stripped, re.IGNORECASE)
+    if leading_letter_match:
+        answer_letter = leading_letter_match.group(1).upper()
+        return answer_letter, infer_answer_index(answer_letter, choices)
+
+    for index, choice in enumerate(choices):
+        if stripped == choice:
+            return None, index
+
+    return None, None
+
+
 @dataclass(frozen=True)
 class ParsedWorldResponse:
     raw_response: str
@@ -127,9 +163,9 @@ class WorldScoreResult:
     exact_answer_text_match: bool
     parsed: ParsedWorldResponse
     question_type: str
-    gold_answer: str
-    gold_answer_index: int | None
-    gold_aliases: list[str]
+    reference_answer: str
+    reference_answer_index: int | None
+    reference_aliases: list[str]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,14 +178,14 @@ class WorldScoreResult:
             "usable_for_distill": self.usable_for_distill,
             "exact_answer_text_match": self.exact_answer_text_match,
             "question_type": self.question_type,
-            "gold_answer": self.gold_answer,
-            "gold_answer_index": self.gold_answer_index,
-            "gold_aliases": self.gold_aliases,
+            "reference_answer": self.reference_answer,
+            "reference_answer_index": self.reference_answer_index,
+            "reference_aliases": self.reference_aliases,
             "parsed": self.parsed.to_dict(),
         }
 
 
-def parse_world_response(raw_response: str, question: BenchmarkQuestion) -> ParsedWorldResponse:
+def parse_world_response(raw_response: str, question: ScoringTask) -> ParsedWorldResponse:
     try:
         payload = orjson.loads(raw_response)
     except orjson.JSONDecodeError:
@@ -183,10 +219,7 @@ def parse_world_response(raw_response: str, question: BenchmarkQuestion) -> Pars
     answer_letter = None
     answer_index = None
     if question.question_type == QUESTION_TYPE_MULTIPLE_CHOICE:
-        match = re.search(r"\b([A-J])\b", raw_response, re.IGNORECASE)
-        if match:
-            answer_letter = match.group(1).upper()
-            answer_index = infer_answer_index(answer_letter, question.choices)
+        answer_letter, answer_index = _infer_mcq_choice_from_freeform(raw_response, question.choices)
 
     return ParsedWorldResponse(
         raw_response=raw_response,
@@ -216,7 +249,7 @@ def _extract_short_open_answer(text: str) -> str:
     return normalized[:160].strip()
 
 
-def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tuple[str | None, dict[str, Any]]:
+def repair_world_response(raw_response: str, question: ScoringTask) -> tuple[str | None, dict[str, Any]]:
     parsed = parse_world_response(raw_response, question)
     if parsed.valid_json:
         return raw_response, {"status": "not_needed"}
@@ -255,15 +288,15 @@ def repair_world_response(raw_response: str, question: BenchmarkQuestion) -> tup
     }
 
 
-def _mcq_correct(parsed: ParsedWorldResponse, question: BenchmarkQuestion) -> tuple[bool, bool]:
-    gold_index = question.gold_answer_index
-    exact_text_match = parsed.answer_text == question.gold_answer if bool(parsed.answer_text) else False
+def _mcq_correct(parsed: ParsedWorldResponse, question: ScoringTask) -> tuple[bool, bool]:
+    reference_index = question.reference_answer_index
+    exact_text_match = parsed.answer_text == question.reference_answer if bool(parsed.answer_text) else False
 
-    if gold_index is not None and parsed.answer_index is not None:
-        return parsed.answer_index == gold_index, exact_text_match
+    if reference_index is not None and parsed.answer_index is not None:
+        return parsed.answer_index == reference_index, exact_text_match
 
-    accepted = {normalize_answer_text(question.gold_answer)}
-    accepted.update(normalize_answer_text(alias) for alias in question.gold_aliases if alias.strip())
+    accepted = {normalize_answer_text(question.reference_answer)}
+    accepted.update(normalize_answer_text(alias) for alias in question.reference_aliases if alias.strip())
 
     for candidate in (parsed.answer_text, parsed.final_answer):
         normalized = normalize_answer_text(candidate)
@@ -273,16 +306,16 @@ def _mcq_correct(parsed: ParsedWorldResponse, question: BenchmarkQuestion) -> tu
     return False, exact_text_match
 
 
-def _open_qa_correct(parsed: ParsedWorldResponse, question: BenchmarkQuestion) -> bool:
+def _open_qa_correct(parsed: ParsedWorldResponse, question: ScoringTask) -> bool:
     final_answer = normalize_answer_text(parsed.final_answer)
     if not final_answer:
         return False
-    accepted = {normalize_answer_text(question.gold_answer)}
-    accepted.update(normalize_answer_text(alias) for alias in question.gold_aliases if alias.strip())
+    accepted = {normalize_answer_text(question.reference_answer)}
+    accepted.update(normalize_answer_text(alias) for alias in question.reference_aliases if alias.strip())
     return final_answer in accepted
 
 
-def score_world_response(raw_response: str, question: BenchmarkQuestion) -> WorldScoreResult:
+def score_world_response(raw_response: str, question: ScoringTask) -> WorldScoreResult:
     parsed = parse_world_response(raw_response, question)
     answer_present = bool(parsed.final_answer or parsed.answer_text or parsed.answer_index is not None)
     reasoning_present = bool(parsed.reasoning.strip())
@@ -291,7 +324,9 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
         correct, exact_answer_text_match = _mcq_correct(parsed, question)
     else:
         correct = _open_qa_correct(parsed, question)
-        exact_answer_text_match = normalize_answer_text(parsed.final_answer) == normalize_answer_text(question.gold_answer)
+        exact_answer_text_match = normalize_answer_text(parsed.final_answer) == normalize_answer_text(
+            question.reference_answer
+        )
 
     usable_for_distill = correct
     total = float(correct)
@@ -307,15 +342,15 @@ def score_world_response(raw_response: str, question: BenchmarkQuestion) -> Worl
         exact_answer_text_match=exact_answer_text_match,
         parsed=parsed,
         question_type=question.question_type,
-        gold_answer=question.gold_answer,
-        gold_answer_index=question.gold_answer_index,
-        gold_aliases=question.gold_aliases,
+        reference_answer=question.reference_answer,
+        reference_answer_index=question.reference_answer_index,
+        reference_aliases=question.reference_aliases,
     )
 
 
 def score_with_optional_repair(
     raw_response: str,
-    question: BenchmarkQuestion,
+    question: ScoringTask,
 ) -> tuple[str, WorldScoreResult, dict[str, Any]]:
     raw_score = score_world_response(raw_response, question)
     if raw_score.correct and raw_score.valid_json:

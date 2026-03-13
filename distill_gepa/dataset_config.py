@@ -66,7 +66,7 @@ def _parse_source(payload: dict[str, Any], *, config_path: Path, index: int) -> 
     provider = _require_str(payload, "provider", context=context)
     adapter = _require_str(payload, "adapter", context=context)
     name = _require_str(payload, "name", context=context)
-    output_file = _optional_str(payload, "output_file") or f"{name}.jsonl"
+    output_file = _optional_str(payload, "output_file") or f"{name}_tasks.jsonl"
     enabled = payload.get("enabled", True)
     if not isinstance(enabled, bool):
         raise ValueError(f"{context}: 'enabled' must be boolean")
@@ -115,7 +115,7 @@ def load_dataset_config(config_path: Path, data_root: Path | None = None) -> Dat
         raise ValueError(f"{config_path} must contain a TOML table")
 
     dataset_name = _optional_str(payload, "name") or config_path.stem
-    merge_output_file = _optional_str(payload, "merge_output_file") or "questions.jsonl"
+    merge_output_file = _optional_str(payload, "merge_output_file") or "tasks.jsonl"
     dataset_root = data_root or (Path("data") / dataset_name)
     sources_payload = payload.get("sources")
     if not isinstance(sources_payload, list) or not sources_payload:

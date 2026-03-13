@@ -1,9 +1,9 @@
-# Seed-Driven Distillation
+# Task-Driven Distillation
 
 This repo runs one pipeline:
 
-1. read seed questions from a local file
-2. auto-download and prepare the dataset if the local seed file is missing
+1. read task seeds from a local file
+2. optionally auto-prepare a dataset from `config/datasets/*.toml`
 3. use one generator model to generate related variants
 4. let all configured answer models answer every generated variant
 5. retry failed answers with model-specific optimized prompts
@@ -158,129 +158,122 @@ In short:
 - reorder models: change the order inside `ANSWER_MODEL_IDS`
 - use different providers per model: set per-model `BASE_URL` and `API_KEY`
 
-## One-Command Reproduction
+## Recommended Commands
 
-Run the README demo with a 100-question cap:
+Prepare an example MMLU task pool:
 
 ```bash
-python scripts/scheduler.py --limit 100
+python scripts/prepare_dataset.py --dataset-config-path config/datasets/mmlu.toml --dataset-name mmlu --limit 100
 ```
 
-This is the recommended command for other people cloning the repo.
-
-## Default Behavior
-
-`python scripts/scheduler.py` uses these defaults:
-
-- seed input path: `data/mmlu_auxiliary_train/questions.jsonl`
-- dataset name: `mmlu_auxiliary_train_seed_run`
-- variants per seed: `12`
-- limit: no limit
-- answer models: all ids listed in `ANSWER_MODEL_IDS`
-
-If `data/mmlu_auxiliary_train/questions.jsonl` does not exist, the scheduler will automatically check:
+Run the pipeline from a prepared task file:
 
 ```bash
-config/datasets/mmlu_auxiliary_train.toml
+python scripts/run_pipeline.py --dataset-name demo_run --task-input-path data/mmlu/tasks.jsonl --limit 100
 ```
 
-and then auto-download/prepare the dataset from Hugging Face before running.
-
-So on a fresh clone, the following is enough:
+Or let the pipeline auto-prepare the task file from a dataset config:
 
 ```bash
-python scripts/scheduler.py --limit 100
+python scripts/run_pipeline.py --dataset-name demo_run --task-input-path data/demo_run/tasks.jsonl --dataset-config-path config/datasets/mmlu.toml --limit 100
 ```
 
 ## Useful Commands
 
-Run all available seed questions:
-
-```bash
-python scripts/scheduler.py
-```
-
 Run a small test:
 
 ```bash
-python scripts/scheduler.py --limit 5
+python scripts/run_pipeline.py --dataset-name smoke --task-input-path data/smoke/tasks.jsonl --dataset-config-path config/datasets/mmlu.toml --limit 5
 ```
 
-Run with a custom seed file:
+Run from a custom task file:
 
 ```bash
-python scripts/scheduler.py --seed-input-path /path/to/wrong_questions.jsonl --dataset-name my_run --variants-per-seed 24
+python scripts/run_pipeline.py --task-input-path /path/to/tasks.jsonl --dataset-name my_run --variants-per-task 24
 ```
 
 ## Final Outputs
 
 The pipeline writes these public outputs:
 
-- `data/<dataset-name>/generated_questions.jsonl`
-- `data/<dataset-name>/distill_data.jsonl`
-- `data/<dataset-name>/unresolved_failures.jsonl`
+- `data/<dataset-name>/question_variants.jsonl`
+- `data/<dataset-name>/variant_results.jsonl`
+- `data/<dataset-name>/failures.jsonl`
+- `data/<dataset-name>/summary.json`
 
 Internal files stay under:
 
 - `data/<dataset-name>/cache/`
+- notably `data/<dataset-name>/cache/api_trace.jsonl`, which stores every model prompt/response pair seen by the pipeline
 
 ## Output Schemas
 
-`generated_questions.jsonl`: one row per original seed question, with all generated variants.
+`question_variants.jsonl`: one row per original task seed, with all generated variants.
 
 Example:
 
 ```json
 {
-  "seed_id": "mmlu_auxiliary_train::auxiliary_train::0",
-  "domain": "abstract algebra",
-  "question_type": "multiple_choice",
-  "question": "Which of these is an element?",
-  "answer": "O_{2}",
-  "answer_index": 1,
+  "question_id": "mmlu::train::0",
+  "data_split": "train",
+  "question_text": "Which of these is an element?",
   "choices": ["KBr", "O_{2}", "2KCl", "FeO_{2}"],
-  "generated_questions": [
+  "reference_answer": "O_{2}",
+  "reference_answer_index": 1,
+  "variants": [
     {
-      "variant_id": "mmlu_auxiliary_train::auxiliary_train::0::variant::0",
-      "question": "Which of the following represents an element rather than a compound or mixture?",
-      "answer": "N_{2}",
-      "answer_index": 1,
+      "id": "mmlu::train::0::variant::0",
+      "question_text": "Which of the following represents an element rather than a compound or mixture?",
       "choices": ["NaCl", "N_{2}", "3MgO", "CaCO_{3}"],
-      "generator_model": "gpt-5.4",
-      "generation_prompt_version": "prompt-xxxx"
+      "reference_answer": "N_{2}",
+      "reference_answer_index": 1
     }
   ]
 }
 ```
 
-`distill_data.jsonl`: one row per kept correct answer.
+`variant_results.jsonl`: one row per successfully resolved variant. If a model initially failed but GEPA later fixed it, the final row stores only the final surviving prompt/response pair for that model.
 
 Example:
 
 ```json
 {
-  "source_type": "direct_answer",
-  "seed_id": "mmlu_auxiliary_train::auxiliary_train::0",
-  "variant_id": "mmlu_auxiliary_train::auxiliary_train::0::variant::0",
-  "model_name": "gemini-3-flash-preview",
-  "question_type": "multiple_choice",
-  "question": "Which of the following represents an element rather than a compound or mixture?",
-  "gold_answer": "N_{2}",
-  "gold_answer_index": 1,
-  "model_answer": "N_{2}",
-  "model_answer_index": 1,
-  "choices": ["NaCl", "N_{2}", "3MgO", "CaCO_{3}"]
+  "id": "mmlu::train::0::variant::0",
+  "question_id": "mmlu::train::0",
+  "data_split": "train",
+  "question_text": "Which of the following represents an element rather than a compound or mixture?",
+  "choices": ["NaCl", "N_{2}", "3MgO", "CaCO_{3}"],
+  "reference_answer": "N_{2}",
+  "reference_answer_index": 1,
+  "status": "resolved_by_gepa",
+  "models": [
+    {
+      "model_name": "gemini-3-flash-preview",
+      "source": "direct",
+      "prompt_text": "You answer questions accurately and concisely.",
+      "response_text": "N_{2}"
+    },
+    {
+      "model_name": "grok-4.1",
+      "source": "gepa",
+      "prompt_text": "improved system prompt text",
+      "response_text": "N_{2}"
+    }
+  ]
 }
 ```
 
-For recovered rows, `source_type` is `optimized_answer`, and the row also includes:
+`failures.jsonl`: one row per variant that still could not be fully resolved. The public failure file is intentionally minimal.
 
-- `direct_model_answer`
-- `direct_model_answer_index`
-- `optimized_system_prompt`
-- `optimized_prompt_version`
+Example:
 
-`unresolved_failures.jsonl`: one row per variant that all models still failed after prompt optimization.
+```json
+{
+  "question_text": "Which option is a pure element?"
+}
+```
+
+`summary.json`: aggregate counts and output locations for the run.
 
 ## Upload Notes
 

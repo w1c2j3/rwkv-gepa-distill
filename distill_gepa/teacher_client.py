@@ -553,12 +553,13 @@ class TeacherClient:
         wants_variants = '"variants"' in prompt_lower or "generate high-quality training variants" in prompt_lower
         wants_optimized_prompt = '"optimized_system_prompt"' in prompt_lower or "improve a system prompt" in prompt_lower
         wants_direct_answer = "answer questions accurately and concisely" in prompt_lower
+        wants_optimized_answer = "return the correct option text" in prompt_lower or "return a short exact answer" in prompt_lower
         open_qa_prompt = "question type: open_qa" in user_message.lower()
         model_name = (self.config.model or "").lower()
 
         option_matches = re.findall(r"^[A-Z]\.\s*(.+)$", user_message, re.MULTILINE)
         if "wrong" in model_name:
-            selected_index = 1 if len(option_matches) > 1 else 0
+            selected_index = 0 if wants_optimized_answer else (1 if len(option_matches) > 1 else 0)
         elif "flip" in model_name:
             digest = hashlib.sha256(user_message.encode("utf-8")).hexdigest()
             selected_index = int(digest[:8], 16) % max(1, len(option_matches) or 2)
@@ -570,7 +571,7 @@ class TeacherClient:
             selected_index = 0
         selected_letter = ANSWER_LABELS[selected_index] if selected_index < len(ANSWER_LABELS) else "A"
         selected_text = option_matches[selected_index] if selected_index < len(option_matches) else "Mock answer"
-        open_answer = "Wrong answer" if "wrong" in model_name else "Mock answer"
+        open_answer = "Wrong answer" if "wrong" in model_name and not wants_optimized_answer else "Mock answer"
 
         if wants_variants:
             if open_qa_prompt:
@@ -617,9 +618,9 @@ class TeacherClient:
                     "optimized_system_prompt": "Answer accurately. For multiple choice, return the correct option text. For open QA, return a short exact answer."
                 }
             ).decode("utf-8")
-        elif wants_direct_answer and open_qa_prompt:
+        elif (wants_direct_answer or wants_optimized_answer) and open_qa_prompt:
             content = open_answer
-        elif wants_direct_answer:
+        elif wants_direct_answer or wants_optimized_answer:
             content = selected_text
         elif wants_json and open_qa_prompt:
             content = orjson.dumps(
