@@ -19,9 +19,7 @@ wheels/
 
 # Generated outputs
 artifacts/
-data/question_pools/
-data/eval_pools/
-data/distill/
+data/
 
 # Large vendor checkouts
 vendor/

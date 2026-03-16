@@ -1,0 +1,51 @@
+[mmlu]
+dataset_name = "cais/mmlu"
+subset = "all"
+split = "test"
+limit = 10
+start_index = 0
+
+[rewrite]
+model = "gpt-5.4"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+variant_count = 12
+max_concurrency = 4
+parse_retry_times = 2
+reasoning_effort = "medium"
+
+[answer]
+max_concurrency = 4
+
+[[answer_models]]
+name = "qwen3-235b-a22b-thinking-2507"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+
+[[answer_models]]
+name = "MiniMax-M2.5"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+
+[[answer_models]]
+name = "glm-4.7"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+
+[[answer_models]]
+name = "kimi-k2.5"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+enable_thinking = true
+
+[output]
+dir = "data"
+original_jsonl = "data/mmlu_original.jsonl"
+variants_jsonl = "data/mmlu_variants.jsonl"
+responses_jsonl = "data/mmlu_responses.jsonl"
+
+[run]
+resume = true
+request_timeout_seconds = 120
+max_retries = 3
+retry_backoff_seconds = 2
