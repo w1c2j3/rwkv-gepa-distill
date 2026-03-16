@@ -38,6 +38,17 @@ base_url = "https://api.ablai.top/v1"
 api_key = "sk-"
 enable_thinking = true
 
+[[answer_models]]
+name = "deepseek-v3.2"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+enable_thinking = true
+
+[[answer_models]]
+name = "doubao-seed-2-0-pro-260215"
+base_url = "https://api.ablai.top/v1"
+api_key = "sk-"
+
 [output]
 dir = "data"
 original_jsonl = "data/mmlu_original.jsonl"
